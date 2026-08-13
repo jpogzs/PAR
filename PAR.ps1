@@ -26,6 +26,69 @@ Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\
           -Destination "$Desktop\PAR.lnk" `
           -Force -ErrorAction SilentlyContinue
 
+# ============================================================
+#  USAGE LOGGING
+# ============================================================
+# Appends one line per launch to a shared CSV so PIA can see who is
+# using PAR and when. Never throws — a log failure must not block the app.
+function Write-ParUsageLog {
+    param(
+        [string]$LogPath = "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\Logs\PAR_usage.csv",
+        [string]$Action  = 'Launch'
+    )
+    try {
+        $logDir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+        }
+        $entry = [PSCustomObject]@{
+            Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            User      = $env:USERNAME
+            Computer  = $env:COMPUTERNAME
+            Action    = $Action
+        }
+        $writeHeader = -not (Test-Path $LogPath)
+        $entry | Export-Csv -Path $LogPath -NoTypeInformation -Append:(!$writeHeader) -Force:$writeHeader -ErrorAction Stop
+    }
+    catch {
+        # Network share unreachable, off-VPN, permissions, etc. — fall back
+        # to a local log so the launch is still recorded somewhere, and
+        # never let a logging failure interrupt the app from starting.
+        try {
+            $fallback = Join-Path $env:TEMP 'PAR_usage_fallback.log'
+            Add-Content -Path $fallback -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $env:USERNAME | $env:COMPUTERNAME | $Action | LOG_ERROR: $($_.Exception.Message)" -ErrorAction SilentlyContinue
+        }
+        catch { }
+    }
+}
+Write-ParUsageLog -Action 'Launch'
+
+# ============================================================
+#  ROLE-BASED ACCESS CHECK
+# ============================================================
+# Confirms the launching user holds role 10 (required for PAR access)
+# before the app is allowed to continue.
+$userEmail = (whoami /upn).Trim()
+$roleApiUrl = "https://api.cmh.platform-prod2.evinternal.net/operations-center/api/UserRole?userEmail=$userEmail"
+try {
+    $roleResponse = Invoke-RestMethod -Uri $roleApiUrl -Method Get -ErrorAction Stop
+}
+catch {
+    Write-ParUsageLog -Action 'RoleCheckFailed'
+    [System.Windows.MessageBox]::Show(
+        "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
+        "Please check your network connection and try again, or contact PIA if this continues.",
+        'PAR — access check failed', 'OK', 'Error') | Out-Null
+    exit 1
+}
+if (-not $roleResponse.roles -or ($roleResponse.roles -notcontains 10)) {
+    Write-ParUsageLog -Action 'Restricted'
+    [System.Windows.MessageBox]::Show(
+        "Restricted`n`nContact PIA",
+        'PAR — access denied', 'OK', 'Warning') | Out-Null
+    exit 1
+}
+
 # ============================================================================
 # EMBEDDED ASSETS  (verbatim PAR.html / src/PAR.css / src/PAR.js)
 # ============================================================================
