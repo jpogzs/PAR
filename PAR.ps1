@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 ============================================================================
 PAR — Prod Active Reports (standalone desktop GUI)
@@ -7,14 +7,6 @@ Created and developed by PIA — members: Pogi, LT, Rona
 Do not edit the code without informing PIA
 ============================================================================
 #>
-
-# ============================================================
-#  SHORTCUT SELF-DEPLOY
-# ============================================================
-$Desktop = [Environment]::GetFolderPath("Desktop")
-Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\PAR.lnk" `
-          -Destination "$Desktop\PAR.lnk" `
-          -Force -ErrorAction SilentlyContinue
 
 [CmdletBinding()]
 param(
@@ -25,6 +17,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+
+# ============================================================
+#  SHORTCUT SELF-DEPLOY
+# ============================================================
+$Desktop = [Environment]::GetFolderPath("Desktop")
+Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\PAR.lnk" `
+          -Destination "$Desktop\PAR.lnk" `
+          -Force -ErrorAction SilentlyContinue
+
 # ============================================================================
 # EMBEDDED ASSETS  (verbatim PAR.html / src/PAR.css / src/PAR.js)
 # ============================================================================
