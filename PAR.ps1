@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 ============================================================================
 PAR — Prod Active Reports (standalone desktop GUI)
@@ -22,7 +22,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 #  SHORTCUT SELF-DEPLOY
 # ============================================================
 $Desktop = [Environment]::GetFolderPath("Desktop")
-Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\PAR.lnk" `
+Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR.lnk" `
           -Destination "$Desktop\PAR.lnk" `
           -Force -ErrorAction SilentlyContinue
 
@@ -109,6 +109,35 @@ PIA members: Pogi, LT, Rona
 </head>
 <body>
   <div id="dupAlertContainer" class="dup-alert-container"></div>
+  <div id="reportDetailOverlay" class="detail-overlay" aria-hidden="true">
+    <div class="detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailModalTitle">
+      <div class="detail-modal-header">
+        <div>
+          <div class="detail-modal-title" id="detailModalTitle">Report</div>
+          <div class="detail-modal-subtitle" id="detailModalSubtitle"></div>
+        </div>
+        <button class="detail-close-btn" id="detailCloseBtn" title="Close" aria-label="Close">×</button>
+      </div>
+      <div class="detail-images-section" id="detailImagesSection">
+        <div class="detail-section-title">Images<span class="detail-images-status" id="detailImagesStatus">Searching…</span></div>
+        <div class="detail-images-grid" id="detailImagesGrid"></div>
+      </div>
+      <div class="detail-tabs" role="tablist">
+        <button class="detail-tab active" id="detailTabOverview" data-tab="overview" role="tab" aria-selected="true">Overview</button>
+        <button class="detail-tab detail-tab-hidden" id="detailTabEvm" data-tab="evm" role="tab" aria-selected="false">EVM Data</button>
+        <button class="detail-tab" id="detailTabHistory" data-tab="history" role="tab" aria-selected="false">History</button>
+      </div>
+      <div class="detail-modal-body" id="detailModalBody">
+        <div class="detail-panel active" id="detailPanelOverview"></div>
+        <div class="detail-panel" id="detailPanelEvm"></div>
+        <div class="detail-panel" id="detailPanelHistory"></div>
+      </div>
+    </div>
+  </div>
+  <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
+    <button class="image-lightbox-close" id="imageLightboxClose" title="Close" aria-label="Close">×</button>
+    <img id="imageLightboxImg" src="" alt="Report image full size">
+  </div>
   <div class="par-tab-bar">
     <div class="tab-logo-block">
       <div class="par-logo-dot"></div>
@@ -220,7 +249,8 @@ PIA members: Pogi, LT, Rona
           <th>Tech ID</th>
           <th>Team</th>
           <th>Location</th>
-          <th>Measurement Item</th>
+          <th>Application</th>
+          <th>Product Type</th>
           <th>Elapsed Time</th>
           <th>Due In</th>
         </tr></thead>
@@ -298,7 +328,8 @@ PIA members: Pogi, LT, Rona
           <th>QC ID</th>
           <th>Team</th>
           <th>Location</th>
-          <th>Measurement Item</th>
+          <th>Application</th>
+          <th>Product Type</th>
           <th>Elapsed Time</th>
           <th>Due In</th>
         </tr></thead>
@@ -652,34 +683,166 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .par-table tbody tr:hover      { background: var(--bg-hover); border-left-color: var(--green) !important; }
 .par-table tbody tr[data-type="training"]       { opacity:0.65; }
 .par-table tbody tr[data-type="training"]:hover { opacity:1; border-left-color: var(--amber) !important; }
+.par-table tbody tr[data-detail-key]            { cursor:pointer; }
 @keyframes rowIn { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:translateY(0)} }
+/* ── REPORT DETAIL MODAL ── */
+.detail-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.detail-overlay.open { opacity: 1; pointer-events: auto; }
+.detail-modal {
+  width: 640px; max-width: 92vw; height: 740px; max-height: 90vh;
+  background: var(--bg-base); border: 1px solid var(--border-light);
+  border-radius: 10px; box-shadow: 0 12px 48px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.15);
+  display: flex; flex-direction: column; overflow: hidden;
+  transform: translateY(8px) scale(0.98); opacity: 0;
+  transition: transform 0.18s ease, opacity 0.18s ease;
+}
+.detail-overlay.open .detail-modal { transform: translateY(0) scale(1); opacity: 1; }
+.detail-modal-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 16px 18px; border-bottom: 1px solid var(--border-light);
+  flex-shrink: 0;
+}
+.detail-modal-title { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-primary); }
+.detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.03em; }
+.detail-product-line { font-size: 12px; color: var(--text-secondary); font-family: var(--sans); }
+.detail-folder-name { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.02em; word-break: break-word; }
+.detail-close-btn {
+  border: none; background: transparent; color: var(--text-muted);
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px;
+  border-radius: 6px; transition: background 0.12s, color 0.12s;
+}
+.detail-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.detail-images-section { flex-shrink: 0; max-height: 200px; overflow-y: auto; padding: 12px 18px 0; }
+.detail-tabs { display: flex; gap: 4px; padding: 12px 18px 0; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
+.detail-tab {
+  border: none; background: transparent; color: var(--text-secondary);
+  font-family: var(--sans); font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 10px 4px; margin-bottom: -1px; cursor: pointer;
+  border-bottom: 2px solid transparent; transition: color 0.12s, border-color 0.12s;
+}
+.detail-tab + .detail-tab { margin-left: 14px; }
+.detail-tab:hover { color: var(--text-primary); }
+.detail-tab.active { color: var(--text-primary); border-bottom-color: var(--green); }
+.detail-tab-hidden { display: none !important; }
+.detail-panel { display: none; }
+.detail-panel.active { display: block; }
+.detail-modal-body { flex: 1 1 auto; min-height: 0; padding: 6px 18px 18px; overflow-y: auto; scrollbar-gutter: stable; }
+.detail-section { margin-top: 16px; }
+.detail-section:first-child { margin-top: 12px; }
+.detail-section-divider { border: none; border-top: 1px solid var(--border-light); margin: 18px 0 0; }
+.detail-section-title {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 6px;
+}
+.detail-row {
+  display: flex; gap: 10px; padding: 5px 0;
+  border-bottom: 1px solid var(--border-light); font-size: 12px;
+}
+.detail-row:last-child { border-bottom: none; }
+.detail-label { flex: 0 0 140px; color: var(--text-muted); }
+.detail-value { flex: 1; color: var(--text-primary); word-break: break-word; }
+.detail-row-split { gap: 24px; }
+.detail-row-half { display: flex; gap: 10px; flex: 1 1 50%; min-width: 0; }
+.detail-row-half .detail-label { flex: 0 0 auto; }
+.detail-row-half .detail-value { flex: 1; }
+.detail-columns { display: flex; gap: 32px; }
+.detail-column { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; }
+@media (max-width: 560px) {
+  .detail-columns { flex-direction: column; gap: 0; }
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content 1fr;
+  column-gap: 0;
+}
+.detail-grid > .detail-label,
+.detail-grid > .detail-value {
+  padding: 5px 20px 5px 0;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 12px;
+}
+.detail-grid > .detail-label { color: var(--text-muted); flex: none; }
+.detail-grid > .detail-value { color: var(--text-primary); word-break: break-word; }
+@media (max-width: 560px) {
+  .detail-grid { grid-template-columns: max-content 1fr; }
+}
+.detail-empty { font-size: 12px; color: var(--text-muted); font-style: italic; }
+.detail-timeline { display: flex; flex-direction: column; gap: 10px; padding-bottom: 18px; }
+.detail-timeline-item { display: flex; gap: 8px; align-items: flex-start; }
+.detail-timeline-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-top: 5px; flex-shrink: 0; }
+.detail-timeline-text { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex: 1; min-width: 0; }
+.detail-timeline-desc { font-size: 12px; color: var(--text-primary); }
+.detail-timeline-time { font-size: 10px; color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+/* ── DETAIL MODAL: IMAGES ── */
+.detail-images-status {
+  font-size: 10px; font-weight: 400; text-transform: none;
+  letter-spacing: 0.02em; color: var(--text-muted); margin-left: 8px;
+}
+.detail-images-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+}
+@media (max-width: 480px) {
+  .detail-images-grid { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
+}
+.detail-image-thumb {
+  position: relative; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden;
+  background: var(--bg-card); border: 1px solid var(--border-light); cursor: pointer;
+}
+.detail-image-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.15s ease; }
+.detail-image-thumb:hover img { transform: scale(1.06); }
+.detail-image-thumb.img-error { display: none; }
+.detail-image-skel {
+  cursor: default;
+  background: linear-gradient(90deg, var(--bg-card) 0%, var(--bg-hover) 40%, var(--bg-card) 80%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+}
+.detail-images-empty { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0; }
+.image-lightbox {
+  position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.82);
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
+}
+.image-lightbox.open { opacity: 1; pointer-events: auto; }
+.image-lightbox img { max-width: 90vw; max-height: 88vh; border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5); }
+.image-lightbox-close {
+  position: absolute; top: 18px; right: 24px; border: none; background: transparent; color: #fff;
+  font-size: 28px; cursor: pointer; line-height: 1; padding: 4px 10px; border-radius: 6px;
+}
+.image-lightbox-close:hover { background: rgba(255,255,255,0.12); }
 .par-table td {
   padding:7px 12px; color:var(--text-primary);
   text-align:center; vertical-align:middle; border:none;
-  font-family:var(--mono); font-size:11px;
+  font-family:var(--mono); font-size:13px;
   background-color: transparent;
 }
 /* ── MEASURE column alignment ── */
 #measure-table td:nth-child(3),#measure-table td:nth-child(4),#measure-table td:nth-child(5),
-#measure-table td:nth-child(6),#measure-table td:nth-child(8),#measure-table td:nth-child(9),#measure-table td:nth-child(10)
-  { text-align:left; font-family:var(--sans); font-size:13px; }
-#measure-table thead th:nth-child(3),#measure-table thead th:nth-child(4),#measure-table thead th:nth-child(5),
-#measure-table thead th:nth-child(6),#measure-table thead th:nth-child(8),#measure-table thead th:nth-child(9),#measure-table thead th:nth-child(10)
+#measure-table td:nth-child(7),#measure-table td:nth-child(8),#measure-table td:nth-child(9),
+#measure-table td:nth-child(10)
   { text-align:left; }
-#measure-table thead th:nth-child(7),#measure-table td:nth-child(7) { text-align:center; }
-#measure-table td:nth-child(2) { font-size:13px; }
-#measure-table td:nth-child(5),#measure-table td:nth-child(6),#measure-table td:nth-child(7),
-#measure-table td:nth-child(8),#measure-table td:nth-child(9),#measure-table td:nth-child(10) { color:var(--text-secondary); }
+#measure-table thead th:nth-child(3),#measure-table thead th:nth-child(4),#measure-table thead th:nth-child(5),
+#measure-table thead th:nth-child(7),#measure-table thead th:nth-child(8),#measure-table thead th:nth-child(9),
+#measure-table thead th:nth-child(10)
+  { text-align:left; }
+#measure-table thead th:nth-child(6),#measure-table td:nth-child(6) { text-align:center; }
+#measure-table td:nth-child(4),#measure-table td:nth-child(5),#measure-table td:nth-child(6),
+#measure-table td:nth-child(7),#measure-table td:nth-child(8),#measure-table td:nth-child(9) { color:var(--text-secondary); }
 /* ── QC column alignment ── */
-#qc-table td:nth-child(3),#qc-table td:nth-child(4),#qc-table td:nth-child(5),
+#qc-table td:nth-child(3),#qc-table td:nth-child(4),#qc-table td:nth-child(6),
 #qc-table td:nth-child(7),#qc-table td:nth-child(8),#qc-table td:nth-child(9)
-  { text-align:left; font-family:var(--sans); font-size:13px; }
-#qc-table thead th:nth-child(3),#qc-table thead th:nth-child(4),#qc-table thead th:nth-child(5),
+  { text-align:left; }
+#qc-table thead th:nth-child(3),#qc-table thead th:nth-child(4),#qc-table thead th:nth-child(6),
 #qc-table thead th:nth-child(7),#qc-table thead th:nth-child(8),#qc-table thead th:nth-child(9)
   { text-align:left; }
-#qc-table td:nth-child(2) { font-size:13px; }
-#qc-table td:nth-child(1),#qc-table td:nth-child(6),#qc-table td:nth-child(7),
-#qc-table td:nth-child(8),#qc-table td:nth-child(9) { color:var(--text-secondary); }
+#qc-table td:nth-child(1),#qc-table td:nth-child(5),#qc-table td:nth-child(6),
+#qc-table td:nth-child(7),#qc-table td:nth-child(8) { color:var(--text-secondary); }
 /* ── BADGES ── */
 .badge-live {
   display:inline-block; font-family:var(--sans); font-size:11px; font-weight:500;
@@ -1378,6 +1541,10 @@ let m_fetchTrainingOnDemand = null;
 let q_fetchTrainingOnDemand = null;
 let m_trainingFetched = false;
 let q_trainingFetched = false;
+/* ── ROW DETAIL STORE ── */
+const rowDetailsStore = {};
+let imageLoadToken = 0;
+let fileInfoLoadToken = 0;
 /* ── DOMContentLoaded ── */
 document.addEventListener('DOMContentLoaded', () => {
   const savedTab = localStorage.getItem('parActiveTab');
@@ -1482,6 +1649,33 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   initColumnVisibility('measure-table', 'hiddenCols_measure', 'm-columnControls');
   initColumnVisibility('qc-table',      'hiddenCols_qc',      'q-columnControls');
+  /* Row click → report detail modal
+     (bound to the table, not the tbody: sorting replaces the tbody node
+     via cloneNode/replaceChild, which would otherwise drop a listener
+     attached directly to the old tbody element) */
+  document.getElementById('measure-table').addEventListener('dblclick', handleRowClickForDetail);
+  document.getElementById('qc-table').addEventListener('dblclick', handleRowClickForDetail);
+  document.getElementById('detailCloseBtn')?.addEventListener('click', closeReportDetailModal);
+  document.getElementById('reportDetailOverlay')?.addEventListener('click', e => {
+    if (e.target.id === 'reportDetailOverlay') closeReportDetailModal();
+  });
+document.querySelector('.detail-modal')?.addEventListener('click', e => {
+    const img = e.target.closest('.detail-image-thumb img');
+    if (img && img.getAttribute('src')) openImageLightbox(img.getAttribute('src'));
+});
+  document.querySelectorAll('.detail-tab').forEach(tab => {
+    tab.addEventListener('click', () => switchDetailTab(tab.dataset.tab));
+  });
+  document.getElementById('imageLightboxClose')?.addEventListener('click', closeImageLightbox);
+  document.getElementById('imageLightbox')?.addEventListener('click', e => {
+    if (e.target.id === 'imageLightbox') closeImageLightbox();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    const lb = document.getElementById('imageLightbox');
+    if (lb && lb.classList.contains('open')) closeImageLightbox();
+    else closeReportDetailModal();
+  });
 });
 /* ── RELOAD TIMER ── */
 function stopReloadTimer() {
@@ -1500,6 +1694,12 @@ function startReloadTimer() {
   let reloadSeconds = 300;
   reloadTimerInterval = setInterval(() => {
     if (!autoReloadEnabled) return;
+    const overlay = document.getElementById('reportDetailOverlay');
+    if (overlay && overlay.classList.contains('open')) {
+      const t = document.getElementById('reloadTimer');
+      if (t) t.textContent = 'Auto Reload: PAUSED (report open)';
+      return;
+    }
     reloadSeconds--;
     const m = String(Math.floor(reloadSeconds/60)).padStart(2,'0');
     const s = String(reloadSeconds%60).padStart(2,'0');
@@ -1762,7 +1962,7 @@ function applyAllFilters(prefix){
       if(isLive)visibleLive++;
       const dueCell=row.cells[row.cells.length-1];
       if(dueCell&&dueCell.style.color==='red')visibleLate++;
-      if(prefix==='m' && !isTrain && row.cells.length>=4){
+      if(prefix==='m' && !isTrain && row.cells.length>=5){
         const stateText=row.cells[3].textContent.trim();
         if(stateText.includes('Being Measured')){
           const username=row.cells[2].textContent.trim();
@@ -1782,6 +1982,16 @@ function applyAllFilters(prefix){
   if(prefix==='m') renderDuplicateUsernameAlerts(visibleBeingMeasuredUsernames);
 }
 /* ── buildTimeCells ── */
+function formatElapsedHuman(totalSeconds){
+  if (isNaN(totalSeconds)) return '';
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 1) return 'Less than a minute';
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours <= 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  if (minutes === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  return `${hours} hour${hours === 1 ? '' : 's'} and ${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
 function buildTimeCells(renderTime,stateTime,dueRaw,isTraining){
   const elapsedSec=isNaN(stateTime.getTime())
     ?NaN
@@ -1814,12 +2024,334 @@ function buildTimeCells(renderTime,stateTime,dueRaw,isTraining){
   return{elapsedCell,dueCell};
 }
 /* ============================================================================
+   REPORT DETAIL MODAL
+   ============================================================================ */
+function handleRowClickForDetail(e){
+  const tr = e.target.closest('tr[data-detail-key]');
+  if (!tr) return;
+  const key = tr.dataset.detailKey;
+  const details = rowDetailsStore[key];
+  if (!details) return;
+  openReportDetailModal(details);
+}
+function detailRow(label, value, color){
+  if (value === undefined || value === null || value === '') return '';
+  const style = color ? ` style="color:${color};"` : '';
+  return `<div class="detail-row"><div class="detail-label">${escapeHtml(label)}</div><div class="detail-value"${style}>${value}</div></div>`;
+}
+function switchDetailTab(tabName){
+  document.querySelectorAll('.detail-tab').forEach(tab => {
+    const isActive = tab.dataset.tab === tabName;
+    tab.classList.toggle('active', isActive);
+    tab.setAttribute('aria-selected', String(isActive));
+  });
+  document.getElementById('detailPanelOverview')?.classList.toggle('active', tabName === 'overview');
+  document.getElementById('detailPanelEvm')?.classList.toggle('active', tabName === 'evm');
+  document.getElementById('detailPanelHistory')?.classList.toggle('active', tabName === 'history');
+  const body = document.getElementById('detailModalBody');
+  if (body) body.scrollTop = 0;
+}
+function openReportDetailModal(details){
+  const overlay = document.getElementById('reportDetailOverlay');
+  const body    = document.getElementById('detailPanelOverview');
+  const title   = document.getElementById('detailModalTitle');
+  const sub     = document.getElementById('detailModalSubtitle');
+  if (!overlay || !body) return;
+  const typeLabel = details.isTraining ? 'Training' : 'Live';
+  const productParts = [typeLabel, details.appLabel, details.primaryProductName, details.deliveryProductName].filter(Boolean).map(escapeHtml);
+  const productLine = productParts.length ? `<span class="detail-product-line">${productParts.join(' &nbsp;·&nbsp; ')}</span>` : '';
+  title.innerHTML = `Report #${details.reportID}`;
+  sub.innerHTML = `${productLine}<div id="detailFolderName" class="detail-folder-name"></div>`;
+  const historyHtml = (details.history && details.history.length)
+    ? `<div class="detail-timeline">${details.history.map(h => `
+        <div class="detail-timeline-item">
+          <span class="detail-timeline-dot"></span>
+          <div class="detail-timeline-text">
+            <div class="detail-timeline-desc">${escapeHtml(h.description || '')}</div>
+            <div class="detail-timeline-time">${h.stateTime ? new Date(h.stateTime).toLocaleString() : ''}</div>
+          </div>
+        </div>`).join('')}</div>`
+    : `<div class="detail-empty">No history available</div>`;
+  const stateTimeDate = details.stateTime ? parseServerUtc(details.stateTime) : new Date(NaN);
+  const elapsedSec = !isNaN(stateTimeDate.getTime())
+    ? Math.max(0, Math.round((Date.now() - stateTimeDate.getTime()) / 1000))
+    : NaN;
+  const elapsedText = !isNaN(elapsedSec) ? formatElapsedHuman(elapsedSec) : '';
+  let elapsedColor = '';
+  if (!isNaN(elapsedSec)) {
+    if (elapsedSec >= 10800 && !details.isTraining) elapsedColor = 'red';
+    else if (elapsedSec >= 7200) elapsedColor = 'orangered';
+    else if (elapsedSec >= 3600) elapsedColor = 'DarkOrange';
+  }
+  const dueDateObj = details.dueDate ? parseServerUtc(details.dueDate) : new Date(NaN);
+  const dueSec = !isNaN(dueDateObj.getTime())
+    ? Math.floor((dueDateObj.getTime() - Date.now()) / 1000)
+    : NaN;
+  const dueDateText = !isNaN(dueDateObj.getTime()) ? dueDateObj.toLocaleString() : '';
+  let dueColor = '';
+  if (!isNaN(dueSec)) {
+    if (dueSec < 3600) dueColor = 'red';
+    else if (dueSec < 7200) dueColor = 'orangered';
+    else if (dueSec < 10800) dueColor = 'DarkOrange';
+  }
+  const isTwisterFileInfo = (details.source==='measure' || details.source==='qc') && details.appLabel==='Twister';
+  const isHipster = details.appLabel === 'Hipster';
+  const measurementItemsHtml = escapeHtml(details.measurementItems || '').replace(/\n/g,'<br>');
+  const reworkNotesInitial = isTwisterFileInfo
+    ? 'Loading…'
+    : (isHipster ? (details.reworkHtml || '(no notes)') : '');
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="detail-columns">
+        <div class="detail-column">
+          <div class="detail-row"><div class="detail-label">Report ID</div><div class="detail-value">${details.reportID}</div></div>
+          <div class="detail-row"><div class="detail-label">State</div><div class="detail-value">${escapeHtml(details.stateLabel || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC' : 'Tech'}</div><div class="detail-value">${escapeHtml(details.userName || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC ID' : 'Tech ID'}</div><div class="detail-value">${escapeHtml(details.techUsername || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Team</div><div class="detail-value">${escapeHtml(details.team || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Location</div><div class="detail-value">${escapeHtml(details.locationName || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Rework Count</div><div class="detail-value">${details.reworkCountHtml || ''}</div></div>
+          <div class="detail-row"><div class="detail-label">Rework Notes</div><div class="detail-value" id="detailReworkNotesValue">${reworkNotesInitial}</div></div>
+        </div>
+        <div class="detail-column">
+          <div class="detail-row"><div class="detail-label">Due Date</div><div class="detail-value"${dueColor ? ` style="color:${dueColor};"` : ''}>${dueDateText}</div></div>
+          <div class="detail-row"><div class="detail-label">Last Modified</div><div class="detail-value">${!isNaN(stateTimeDate.getTime()) ? stateTimeDate.toLocaleString() : ''}</div></div>
+          <div class="detail-row"><div class="detail-label">Elapsed Time</div><div class="detail-value"${elapsedColor ? ` style="color:${elapsedColor};"` : ''}>${elapsedText}</div></div>
+          <div class="detail-row"><div class="detail-label">Product Type</div><div class="detail-value">${escapeHtml(details.primaryProductName || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Delivery Type</div><div class="detail-value">${escapeHtml(details.deliveryProductName || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Application</div><div class="detail-value">${escapeHtml(details.appLabel || '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Measurement Items</div><div class="detail-value">${measurementItemsHtml}</div></div>
+          <div class="detail-row"><div class="detail-label">Rejection History</div><div class="detail-value">${details.rejectionHistoryHtml || ''}</div></div>
+        </div>
+      </div>
+      ${detailRow('Measured Tech', escapeHtml(details.measuredTech || ''))}
+      ${detailRow('Rework Details', details.reworkHtml)}
+    </div>
+  `;
+  const historyPanel = document.getElementById('detailPanelHistory');
+  if (historyPanel) {
+    historyPanel.innerHTML = `
+    <div class="detail-section">
+      ${historyHtml}
+    </div>
+  `;
+  }
+  const evmTabBtn = document.getElementById('detailTabEvm');
+  const evmPanel  = document.getElementById('detailPanelEvm');
+  if (evmTabBtn) evmTabBtn.classList.toggle('detail-tab-hidden', !isTwisterFileInfo);
+  if (evmPanel) {
+    evmPanel.innerHTML = isTwisterFileInfo ? `
+    <div class="detail-section">
+      <div class="detail-row"><div class="detail-label">Roof</div><div class="detail-value" id="detailRoofValue">Loading…</div></div>
+      <div class="detail-row"><div class="detail-label">Penetration</div><div class="detail-value" id="detailPenetrationValue">Loading…</div></div>
+      <div class="detail-row"><div class="detail-label">Wall</div><div class="detail-value" id="detailWallValue">Loading…</div></div>
+      <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC Time' : 'Tech Time'}</div><div class="detail-value" id="detailTechTimeValue">Loading…</div></div>
+      <div class="detail-row"><div class="detail-label">Last QC</div><div class="detail-value" id="detailLastQcValue">Loading…</div></div>
+      <div class="detail-row"><div class="detail-label">Notes</div><div class="detail-value" id="detailEvmNotesValue">Loading…</div></div>
+      <div class="detail-row" id="detailFileMeasuredRow">
+        <div class="detail-label">File Measured</div>
+        <div class="detail-value" id="detailFileMeasuredValue">Loading…</div>
+      </div>
+    </div>
+  ` : '';
+  }
+  const imagesGrid = document.getElementById('detailImagesGrid');
+  const imagesStatus = document.getElementById('detailImagesStatus');
+  if (imagesGrid) imagesGrid.innerHTML = buildImageSkeletons();
+  if (imagesStatus) imagesStatus.textContent = 'Searching…';
+  switchDetailTab('overview');
+  overlay.classList.add('open');
+  overlay.setAttribute('aria-hidden', 'false');
+  if (isTwisterFileInfo) {
+    // Kick off a broad image search by report ID immediately instead of
+    // waiting for File Info to resolve the exact .evm/folder name first —
+    // that SMB lookup + fileinfo.exe run was serializing the two calls and
+    // made the images appear noticeably late. loadFileInfo will refine the
+    // image search with the exact folder name once it resolves; the token
+    // check inside loadReportImages ensures only the latest result renders.
+    loadReportImages(details.reportID, details.locationName);
+    loadFileInfo(details.reportID, details.techUsername, details.teamNumber, details.locationName, details.stateLabel, details.source);
+  } else {
+    loadReportImages(details.reportID, details.locationName);
+  }
+}
+function buildImageSkeletons(count = 5){
+  return Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
+}
+function getEvmBaseName(filePath){
+  if (!filePath) return '';
+  const parts = String(filePath).split(/[\\\/]/);
+  const fileName = parts[parts.length - 1] || '';
+  return fileName.replace(/\.evm$/i, '');
+}
+function loadReportImages(reportId, locationName, folderName){
+  const myToken = ++imageLoadToken;
+  const grid       = document.getElementById('detailImagesGrid');
+  const status     = document.getElementById('detailImagesStatus');
+  const folderNameEl = document.getElementById('detailFolderName');
+  if (!grid) return;
+  const qs = new URLSearchParams({ reportId: String(reportId), location: locationName || '' });
+  if (folderName) qs.set('folderName', folderName);
+  fetch(`/api/images?${qs.toString()}`)
+    .then(r => r.json().catch(() => ({ found: false, error: 'Unexpected response from image search' })))
+    .then(data => {
+      if (myToken !== imageLoadToken) return;
+      if (data && data.found && Array.isArray(data.images) && data.images.length) {
+        if (status) status.textContent = '';
+        if (folderNameEl) folderNameEl.textContent = data.folder || '';
+        grid.innerHTML = data.images.map(src => `
+          <div class="detail-image-thumb">
+            <img src="${src}" alt="Report image" loading="eager" decoding="async" fetchpriority="high" onerror="this.closest('.detail-image-thumb').classList.add('img-error')">
+          </div>`).join('');
+      } else if (data && data.found) {
+        if (status) status.textContent = '';
+        if (folderNameEl) folderNameEl.textContent = data.folder || '';
+        grid.innerHTML = `<div class="detail-images-empty">No images found in the Images subfolder.</div>`;
+      } else {
+        if (status) status.textContent = '';
+        if (folderNameEl) folderNameEl.textContent = '';
+        grid.innerHTML = `<div class="detail-images-empty">${escapeHtml((data && (data.message || data.error)) || 'No matching report folder found.')}</div>`;
+      }
+    })
+    .catch(() => {
+      if (myToken !== imageLoadToken) return;
+      if (status) status.textContent = '';
+      grid.innerHTML = `<div class="detail-images-empty">Couldn't reach the archive share. Check your network/VPN connection.</div>`;
+    });
+}
+function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLabel, source){
+  const myToken = ++fileInfoLoadToken;
+  const roofEl     = document.getElementById('detailRoofValue');
+  const penEl      = document.getElementById('detailPenetrationValue');
+  const wallEl     = document.getElementById('detailWallValue');
+  const techTimeEl = document.getElementById('detailTechTimeValue');
+  const lastQcEl   = document.getElementById('detailLastQcValue');
+  const evmNotesEl = document.getElementById('detailEvmNotesValue');
+  const notesEl    = document.getElementById('detailReworkNotesValue');
+  const measuredEl = document.getElementById('detailFileMeasuredValue');
+  if (!roofEl) return;
+  const fieldEls = [roofEl, penEl, wallEl, techTimeEl, lastQcEl, evmNotesEl];
+  const setFields = (text) => fieldEls.forEach(el => { if (el) el.textContent = text; });
+  const isQc = source === 'qc';
+  // The .evm's location depends on source + state:
+  //  Measure — Being Measured: tech's own InProgress box (tech ID + team).
+  //          — Ready To Measure: fixed "[TeamLead]\New".
+  //  QC — Being Qced: the QC's own InProgress box (QC ID + QC team).
+  //     — Ready For QC: fixed "2_Measured\QC\[TeamLead]\New".
+  // "Fixed folder" states don't need a per-tech/QC box, so only require an
+  // ID + team for the "in someone's box" states.
+  const isFixedFolder = isQc
+    ? /^Ready For QC/i.test(stateLabel || '')
+    : (stateLabel === 'Ready To Measure');
+  if (!isFixedFolder && (!techUsername || !teamNumber)) {
+    const message = (isQc ? 'QC ID' : 'Tech ID') + ' or team not available for this report yet.';
+    setFields(message);
+    if (notesEl) notesEl.textContent = message;
+    if (measuredEl) measuredEl.textContent = message;
+    loadReportImages(reportId, locationName);
+    return;
+  }
+  setFields('Loading…');
+  if (measuredEl) measuredEl.textContent = 'Loading…';
+  const qs = new URLSearchParams({
+    reportId: String(reportId),
+    techId: String(techUsername || ''),
+    teamNumber: String(teamNumber || ''),
+    location: String(locationName || ''),
+    state: String(stateLabel || ''),
+    source: String(source || 'measure')
+  });
+  fetch(`/api/file-info?${qs.toString()}`)
+    .then(r => r.json().catch(() => ({ found: false, error: 'Unexpected response from file info lookup' })))
+    .then(data => {
+      if (myToken !== fileInfoLoadToken) return;
+      if (data && data.found) {
+        let parsed = null;
+        try { parsed = JSON.parse(data.output || '{}'); } catch { parsed = null; }
+        if (parsed) {
+          const userTimes = parsed.user_times || {};
+          const techKey = techUsername
+            ? Object.keys(userTimes).find(k => k.toUpperCase().startsWith(String(techUsername).toUpperCase()))
+            : null;
+          const techTotalTime = techKey ? (userTimes[techKey].total_time || '') : '';
+          if (roofEl) roofEl.textContent = parsed.roof ?? '';
+          if (penEl) penEl.textContent = parsed.penetration ?? '';
+          if (wallEl) wallEl.textContent = parsed.wall ?? '';
+          if (techTimeEl) techTimeEl.textContent = techTotalTime;
+          if (lastQcEl) lastQcEl.textContent = parsed.qc ?? '';
+          if (evmNotesEl) evmNotesEl.textContent = parsed.notes ?? '';
+          if (notesEl) notesEl.textContent = parsed.notes ? parsed.notes : '(no notes)';
+        } else {
+          const raw = data.output && data.output.trim() ? data.output : '(no output)';
+          if (roofEl) roofEl.textContent = '';
+          if (penEl) penEl.textContent = '';
+          if (wallEl) wallEl.textContent = '';
+          if (techTimeEl) techTimeEl.textContent = '';
+          if (lastQcEl) lastQcEl.textContent = '';
+          if (evmNotesEl) evmNotesEl.textContent = raw;
+          if (notesEl) notesEl.textContent = '(unable to parse file info)';
+        }
+        if (measuredEl) measuredEl.textContent = data.filePath || '(path not returned)';
+        // Twister's .evm filename (minus extension) is the exact archive
+        // folder name, so go straight there instead of scanning the share.
+        const evmBaseName = getEvmBaseName(data.filePath);
+        loadReportImages(reportId, locationName, evmBaseName);
+      } else {
+        // "No rollback found" isn't useful on its own — show the short
+        // two-level box path (e.g. "2027JHTCT79\InProgress") instead so the
+        // person can see exactly where the .evm was expected to be.
+        const shortPath = data && data.searchedPath;
+        const notFoundMessage = shortPath
+          ? `EVM not found in ${shortPath}`
+          : ((data && (data.message || data.error)) || 'File info not available.');
+        setFields(notFoundMessage);
+        if (notesEl) notesEl.textContent = notFoundMessage;
+        if (measuredEl) measuredEl.textContent = notFoundMessage;
+        // No filename to go on — fall back to the archive search by report ID.
+        loadReportImages(reportId, locationName);
+      }
+    })
+    .catch(() => {
+      if (myToken !== fileInfoLoadToken) return;
+      const message = "Couldn't reach the local file-info service.";
+      setFields(message);
+      if (notesEl) notesEl.textContent = message;
+      if (measuredEl) measuredEl.textContent = message;
+      loadReportImages(reportId, locationName);
+    });
+}
+function openImageLightbox(src){
+  const lb  = document.getElementById('imageLightbox');
+  const img = document.getElementById('imageLightboxImg');
+  if (!lb || !img) return;
+  img.src = src;
+  lb.classList.add('open');
+  lb.setAttribute('aria-hidden', 'false');
+}
+function closeImageLightbox(){
+  const lb = document.getElementById('imageLightbox');
+  if (!lb) return;
+  lb.classList.remove('open');
+  lb.setAttribute('aria-hidden', 'true');
+  const img = document.getElementById('imageLightboxImg');
+  if (img) img.src = '';
+}
+function closeReportDetailModal(){
+  const overlay = document.getElementById('reportDetailOverlay');
+  if (!overlay) return;
+  overlay.classList.remove('open');
+  overlay.setAttribute('aria-hidden', 'true');
+  closeImageLightbox();
+  imageLoadToken++;
+  fileInfoLoadToken++;
+}
+/* ============================================================================
    MEASURE: MAIN DATA FETCH
    ============================================================================ */
 let m_pendingFetches=0, m_fileCount=0;
 (function measureMain(){
   fetch('https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Team')
-    .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam:new Map(d.map(t=>[t.teamId,t.name]))}))
+    .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam:new Map(d.map(t=>[t.teamId,{name:t.name,teamNumber:t.teamNumber}]))}))
     .then(({dictTeam})=>fetch('https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Location')
       .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam,dictLocation:new Map(d.map(l=>[l.id,l.description]))})))
     .then(({dictTeam,dictLocation})=>{
@@ -1831,6 +2363,7 @@ let m_pendingFetches=0, m_fileCount=0;
       if(!Array.isArray(apiData))return;
       apiData.forEach(item=>{
         m_pendingFetches++; m_fileCount++;
+        const rowKey=`m-${item.reportID}-${m_fileCount}`;
         fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Report/${item.reportID}`)
           .then(r=>r.ok?r.json():Promise.reject())
           .then(report=>{
@@ -1856,24 +2389,39 @@ let m_pendingFetches=0, m_fileCount=0;
           .then(({report,pmText,task,rejectedCounts,entries,user})=>
             fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Report/${item.reportID}/measurement-items`)
               .then(r=>r.ok?r.json():Promise.reject()).then(mItems=>({report,pmText,task,rejectedCounts,entries,user,mItems})))
-          .then(({report,pmText,task,rejectedCounts,entries,user,mItems})=>{
+          .then(({report,pmText,task,rejectedCounts,entries,user,mItems})=>
+            fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/TaskTrafficView/report/${item.reportID}`)
+              .then(r=>r.ok?r.json():Promise.reject())
+              .then(productInfo=>({report,pmText,task,rejectedCounts,entries,user,mItems,deliveryProductName:productInfo?.deliveryProductName??'',primaryProductName:productInfo?.primaryProductName??''}))
+              .catch(()=>({report,pmText,task,rejectedCounts,entries,user,mItems,deliveryProductName:'',primaryProductName:''})))
+          .then(({report,pmText,task,rejectedCounts,entries,user,mItems,deliveryProductName,primaryProductName})=>{
             const locationName=dictLocation.get(user[0]?.locationId)??'';
             const hasReworkHistory=[...rejectedCounts.keys()].some(type=>/rework/i.test(type));
             if(!hasReworkHistory){
-              return{report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails:'',locationName};
+              return{report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails:'',locationName,deliveryProductName,primaryProductName};
             }
             return fetchMeasureReworkDetails(item.reportID,locationName)
-              .then(reworkDetails=>({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName}));
+              .then(reworkDetails=>({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName,deliveryProductName,primaryProductName}));
           })
-          .then(({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName})=>{
+          .then(({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName,deliveryProductName,primaryProductName})=>{
             const mText=(mItems.measurementItems||[]).map(m=>'*'+(m.name||'').replace(/\s+/g,'')).join('  ');
-            const rejectedSuffix=[...rejectedCounts.entries()].map(([type,count])=>{
+            const styleRejectedEntry=([type,count])=>{
               let color;
               if(count>=3)      color='red';
               else if(count===2) color='DarkOrange';
               else               color=isRTM?'var(--text-primary)':'var(--text-secondary)';
               return `<span style="color:${color};">${type} ${count}x</span>`;
-            }).join('<br>');
+            };
+            const rejectedSuffix=[...rejectedCounts.entries()].map(styleRejectedEntry).join('<br>');
+            const reworkTotalCount=[...rejectedCounts.entries()].filter(([type])=>/rework/i.test(type)).reduce((sum,[,count])=>sum+count,0);
+            const reworkCountHtml=reworkTotalCount?(()=>{
+              let color;
+              if(reworkTotalCount>=3)      color='red';
+              else if(reworkTotalCount===2) color='DarkOrange';
+              else                          color=isRTM?'var(--text-primary)':'var(--text-secondary)';
+              return `<span style="color:${color};">${reworkTotalCount}</span>`;
+            })():'';
+            const rejectionHistoryHtml=[...rejectedCounts.entries()].filter(([type])=>!/rework/i.test(type)).map(styleRejectedEntry).join('<br>');
             const reworkHtml=escapeHtml(reworkDetails).replace(/\n/g,'<br>');
             const isHipsterErrorRow =
               /bellevue/i.test(locationName) ||
@@ -1882,7 +2430,35 @@ let m_pendingFetches=0, m_fileCount=0;
             const siteTag = isHipsterErrorRow
               ? extractSiteTag(entries)
               : '';
-            let row=`<tr data-type="${isTraining?'training':'live'}">
+            const appLabel = (mItems.measurementItems||[]).some(m=>/hipster/i.test(m.name||''))
+              ? 'Hipster'
+              : 'Twister';
+            rowDetailsStore[rowKey]={
+              reportID:item.reportID,
+              pmText,
+              isTraining,
+              source:'measure',
+              stateLabel:isRTM?'Ready To Measure':'Being Measured',
+              appLabel,
+              reworkCount:reworkTotalCount,
+              userName:(user[0]?.userName??'')+siteTag,
+              techUsername:user[0]?.techUsername??'',
+              team:dictTeam.get(user[0]?.teamId)?.name??'',
+              teamNumber:dictTeam.get(user[0]?.teamId)?.teamNumber??'',
+              locationName,
+              deliveryProductName,
+              primaryProductName,
+              measurementItems:(mItems.measurementItems||[]).map(m=>m.name).filter(Boolean).join('\n')+(pmText?' [PM]':''),
+              stateTime:task.stateTime,
+              dueDate:item.dueDate,
+              rejectedSuffix,
+              reworkCountHtml,
+              rejectionHistoryHtml,
+              reworkHtml,
+              history:entries.map(e=>({description:e.description,stateTime:e.stateTime}))
+                .sort((a,b)=>new Date(b.stateTime)-new Date(a.stateTime))
+            };
+            let row=`<tr data-type="${isTraining?'training':'live'}" data-detail-key="${rowKey}">
 <td><span class="${isTraining?'badge-training':'badge-live'}">${isTraining?'Training':'Live'}</span></td>
 <td>${item.reportID}</td>
 <td>${user[0]?.userName??''}${siteTag}</td>
@@ -1890,9 +2466,10 @@ let m_pendingFetches=0, m_fileCount=0;
 <td style="color:${isRTM?'var(--text-primary)':'var(--text-secondary)'};">${rejectedSuffix}</td>
 <td style="color:${isRTM?'var(--text-primary)':'var(--text-secondary)'};">${reworkHtml}</td>
 <td>${user[0]?.techUsername??''}</td>
-<td>${dictTeam.get(user[0]?.teamId)??''}</td>
+<td>${dictTeam.get(user[0]?.teamId)?.name??''}</td>
 <td>${locationName}</td>
-<td>${mText}${pmText}</td>`;
+<td>${appLabel}</td>
+<td>${escapeHtml(primaryProductName||'')}</td>`;
             const renderTime=new Date();
             const stateTime=parseServerUtc(task.stateTime);
             const dueRaw=parseServerUtc(item.dueDate);
@@ -1904,12 +2481,12 @@ let m_pendingFetches=0, m_fileCount=0;
             applyAllFilters('m');
             initColumnVisibility('measure-table','hiddenCols_measure','m-columnControls');
             m_pendingFetches--;
-            if(m_pendingFetches===0){sortTableByColumn('measure-table',11,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(m_pendingFetches===0){sortTableByColumn('measure-table',12,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
           })
           .catch(err=>{
             console.error('measure report chain error:',err);
             m_pendingFetches=Math.max(0,m_pendingFetches-1);
-            if(m_pendingFetches===0){sortTableByColumn('measure-table',11,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(m_pendingFetches===0){sortTableByColumn('measure-table',12,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
           });
       });
     }
@@ -1935,14 +2512,14 @@ function colorDuplicateMeasureUsernames(){
   const uC=new Map(),tC=new Map();
   rows.forEach(row=>{
     const cells=row.cells;
-    if(cells.length>=7&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
+    if(cells.length>=8&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
       const u=cells[2].textContent.trim(),t=cells[6].textContent.trim();
       if(u)uC.set(u,(uC.get(u)||0)+1); if(t)tC.set(t,(tC.get(t)||0)+1);
     }
   });
   rows.forEach(row=>{
     const cells=row.cells;
-    if(cells.length>=7&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
+    if(cells.length>=8&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
       const u=cells[2].textContent.trim(),t=cells[6].textContent.trim();
       if(u&&uC.get(u)>1)cells[2].style.color='red';
       if(t&&tC.get(t)>1)cells[6].style.color='red';
@@ -1969,7 +2546,7 @@ function renderDuplicateUsernameAlerts(usernameCounts){
 let q_pendingFetches=0, q_fileCount=0;
 (function qcMain(){
   fetch('https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Team')
-    .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam:new Map(d.map(t=>[t.teamId,t.name]))}))
+    .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam:new Map(d.map(t=>[t.teamId,{name:t.name,teamNumber:t.teamNumber}]))}))
     .then(({dictTeam})=>fetch('https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Location')
       .then(r=>r.ok?r.json():Promise.reject()).then(d=>({dictTeam,dictLocation:new Map(d.map(l=>[l.id,l.description]))})))
     .then(({dictTeam,dictLocation})=>{
@@ -1981,6 +2558,7 @@ let q_pendingFetches=0, q_fileCount=0;
       if(!Array.isArray(apiData))return;
       apiData.forEach(item=>{
         q_pendingFetches++; q_fileCount++;
+        const rowKey=`q-${item.reportID}-${q_fileCount}`;
         let lastMeasured=null;
         fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Report/${item.reportID}`)
           .then(r=>r.ok?r.json():Promise.reject())
@@ -2010,13 +2588,21 @@ let q_pendingFetches=0, q_fileCount=0;
           .then(({report,pmText,task,isRework,task2Entries,user})=>
             fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/Report/${item.reportID}/measurement-items`)
               .then(r=>r.ok?r.json():Promise.reject()).then(mItems=>({report,pmText,task,isRework,task2Entries,user,mItems})))
-          .then(({report,pmText,task,isRework,task2Entries,user,mItems})=>{
+          .then(({report,pmText,task,isRework,task2Entries,user,mItems})=>
+            fetch(`https://api.cmh.platform-prod2.evinternal.net/operations-center/api/TaskTrafficView/report/${item.reportID}`)
+              .then(r=>r.ok?r.json():Promise.reject())
+              .then(productInfo=>({report,pmText,task,isRework,task2Entries,user,mItems,deliveryProductName:productInfo?.deliveryProductName??'',primaryProductName:productInfo?.primaryProductName??''}))
+              .catch(()=>({report,pmText,task,isRework,task2Entries,user,mItems,deliveryProductName:'',primaryProductName:''})))
+          .then(({report,pmText,task,isRework,task2Entries,user,mItems,deliveryProductName,primaryProductName})=>{
             const mText=(mItems.measurementItems||[]).map(m=>'*'+(m.name||'').replace(/\s+/g,'')).join('  ');
             const typeBadge=isTraining?'<span class="badge-training">Training</span>':'<span class="badge-live">Live</span>';
             const stateLabel=isRFQC
               ?`Ready For QC${isRework?' (Rework)':''}`
               :`Being Qced${isRework?' (Rework)':''}`;
             const qcLocationName=dictLocation.get(user[0]?.locationId)??'';
+            const appLabel = (mItems.measurementItems||[]).some(m=>/hipster/i.test(m.name||''))
+              ? 'Hipster'
+              : 'Twister';
             const isHipsterErrorRowQC =
               /bellevue/i.test(qcLocationName) ||
               /hipster/i.test(qcLocationName)  ||
@@ -2024,16 +2610,55 @@ let q_pendingFetches=0, q_fileCount=0;
             const siteTagQC = isHipsterErrorRowQC
               ? extractSiteTag(task2Entries)
               : '';
-            let row=`<tr data-type="${isTraining?'training':'live'}">
+            const lastMeasuredTech=lastMeasured&&lastMeasured.description?(lastMeasured.description.match(/\(([^)]+)\)/)||[])[1]||'':'';
+            const reworkCount=task2Entries.reduce((count,e)=>{
+              const match=e.description&&e.description.match(/Rejected\(([^)]+)\)/);
+              return(match&&/rework/i.test(match[1]))?count+1:count;
+            },0);
+            const reworkCountHtml=reworkCount?(()=>{
+              let color;
+              if(reworkCount>=3)      color='red';
+              else if(reworkCount===2) color='DarkOrange';
+              else                     color=isRFQC?'var(--text-primary)':'var(--text-secondary)';
+              return `<span style="color:${color};">${reworkCount}</span>`;
+            })():'';
+            rowDetailsStore[rowKey]={
+              reportID:item.reportID,
+              pmText,
+              isTraining,
+              source:'qc',
+              stateLabel,
+              appLabel,
+              reworkCount,
+              measuredTech:lastMeasuredTech,
+              userName:(user[0]?.userName??'')+siteTagQC,
+              techUsername:user[0]?.techUsername??'',
+              team:dictTeam.get(user[0]?.teamId)?.name??'',
+              teamNumber:dictTeam.get(user[0]?.teamId)?.teamNumber??'',
+              locationName:qcLocationName,
+              deliveryProductName,
+              primaryProductName,
+              measurementItems:(mItems.measurementItems||[]).map(m=>m.name).filter(Boolean).join('\n')+(pmText?' [PM]':''),
+              stateTime:task.stateTime,
+              dueDate:item.dueDate,
+              rejectedSuffix:lastMeasuredTech?`Measured Tech: ${lastMeasuredTech}`:'',
+              reworkCountHtml,
+              rejectionHistoryHtml:'',
+              reworkHtml:'',
+              history:task2Entries.map(e=>({description:e.description,stateTime:e.stateTime}))
+                .sort((a,b)=>new Date(b.stateTime)-new Date(a.stateTime))
+            };
+            let row=`<tr data-type="${isTraining?'training':'live'}" data-detail-key="${rowKey}">
 <td>${typeBadge}</td>
 <td>${item.reportID}</td>
 <td style="color:${isRFQC?'var(--text-primary)':'var(--text-secondary)'};">${stateLabel}</td>
 <td>${lastMeasured&&lastMeasured.description?(lastMeasured.description.match(/\(([^)]+)\)/)||[])[1]||'':''}</td>
 <td>${user[0]?.userName??''}${siteTagQC}</td>
 <td>${user[0]?.techUsername??''}</td>
-<td>${dictTeam.get(user[0]?.teamId)??''}</td>
+<td>${dictTeam.get(user[0]?.teamId)?.name??''}</td>
 <td>${dictLocation.get(user[0]?.locationId)??''}</td>
-<td>${mText}${pmText}</td>`;
+<td>${appLabel}</td>
+<td>${escapeHtml(primaryProductName||'')}</td>`;
             const renderTime=new Date();
             const stateTime=parseServerUtc(task.stateTime);
             const dueRaw=parseServerUtc(item.dueDate);
@@ -2045,12 +2670,12 @@ let q_pendingFetches=0, q_fileCount=0;
             applyAllFilters('q');
             initColumnVisibility('qc-table','hiddenCols_qc','q-columnControls');
             q_pendingFetches--;
-            if(q_pendingFetches===0){sortTableByColumn('qc-table',10,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(q_pendingFetches===0){sortTableByColumn('qc-table',11,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
           })
           .catch(err=>{
             console.error('qc report chain error:',err);
             q_pendingFetches=Math.max(0,q_pendingFetches-1);
-            if(q_pendingFetches===0){sortTableByColumn('qc-table',10,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(q_pendingFetches===0){sortTableByColumn('qc-table',11,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
           });
       });
     }
@@ -2382,8 +3007,8 @@ let q_pendingFetches=0, q_fileCount=0;
     });
   }
   const SKELETON_TABLES = [
-    { tbodyId: 'm-data', colCount: 12, widths: ['sk-sm','sk-md','sk-lg','sk-md','sk-sm','sk-lg','sk-xs','sk-md','sk-sm','sk-xl','sk-xs','sk-xs'] },
-    { tbodyId: 'q-data', colCount: 11, widths: ['sk-sm','sk-md','sk-lg','sk-md','sk-sm','sk-xs','sk-md','sk-sm','sk-xl','sk-xs','sk-xs'] }
+    { tbodyId: 'm-data', colCount: 12, widths: ['sk-sm','sk-md','sk-lg','sk-md','sk-sm','sk-lg','sk-xs','sk-md','sk-sm','sk-sm','sk-xs','sk-xs'] },
+    { tbodyId: 'q-data', colCount: 11, widths: ['sk-sm','sk-md','sk-lg','sk-md','sk-sm','sk-xs','sk-md','sk-sm','sk-sm','sk-xs','sk-xs'] }
   ];
   const SKELETON_ROW_COUNT = 5;
   function buildSkeletonRow(colCount, widths) {
@@ -2513,6 +3138,42 @@ let q_pendingFetches=0, q_fileCount=0;
 })();
 '@
 # ============================================================================
+# 0. fileinfo.exe local cache (avoid re-fetching over SMB on every request)
+# ============================================================================
+# The File Info panel was slow because Handle-FileInfo invoked fileinfo.exe
+# straight off a UNC path on every single request — Windows has to pull the
+# executable over SMB each time before it can even start running, on top of
+# whatever the tool itself does. Same fix as the WebView2 SDK below: fetch
+# once, cache locally, and only re-copy if the share's copy is newer.
+function Get-FileInfoExeLocal {
+    $cacheDir   = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
+    $localExe   = Join-Path $cacheDir 'fileinfo.exe'
+    $remoteBase = '\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\fileinfo'
+    $remoteExe  =
+        if (Test-Path -LiteralPath "$remoteBase.exe" -PathType Leaf) { "$remoteBase.exe" }
+        elseif (Test-Path -LiteralPath $remoteBase -PathType Leaf) { $remoteBase }
+        else { $null }
+    if (-not $remoteExe) {
+        # Share unreachable / tool missing — fall back to any already-cached
+        # local copy rather than failing outright.
+        if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
+        return $null
+    }
+    try {
+        $needsCopy = (-not (Test-Path -LiteralPath $localExe -PathType Leaf)) -or
+                     ((Get-Item -LiteralPath $remoteExe).LastWriteTime -gt (Get-Item -LiteralPath $localExe).LastWriteTime)
+        if ($needsCopy) {
+            New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+            Copy-Item -LiteralPath $remoteExe -Destination $localExe -Force
+        }
+    }
+    catch {
+        # Copy failed (offline, permissions, etc.) — use whatever's cached, if anything.
+    }
+    if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
+    return $null
+}
+# ============================================================================
 # 1. WebView2 SDK bootstrap (download once, cache under %LOCALAPPDATA%)
 # ============================================================================
 function Get-WebView2Assemblies {
@@ -2578,6 +3239,22 @@ function Get-FreeLoopbackPort {
 }
 $port   = Get-FreeLoopbackPort
 $prefix = "http://127.0.0.1:$port/"
+# Network shares containing per-report archive folders and their images,
+# selected by the report's Location column.
+$ArchiveRoots = @{
+    Cebu    = '\\ceb-pure01.mnl.eagleview.com\reports-production\archive'
+    Manila  = '\\mnl-pure01.mnl.eagleview.com\reports-production\archive'
+    Default = '\\reports-fs-sing.cmh.reportsprod.evinternal.net\Production\archive'
+}
+# Tech "InProgress" boxes, where a tech's working .evm rollback files live
+# while a report is being measured. Folder name is "<TechID>TCT<teamNumber>",
+# e.g. "1580LGTCT24". Selected by the report's Location column, same as
+# $ArchiveRoots above.
+$InProgressRoots = @{
+    Cebu    = '\\ceb-pure01.mnl.eagleview.com\reports-production\1_InBox\Day Shift'
+    Manila  = '\\mnl-pure01.mnl.eagleview.com\reports-production\1_InBox\Day Shift'
+    Default = '\\reports-fs-sing.cmh.reportsprod.evinternal.net\Production\1_InBox\Day Shift'
+}
 $assets = @{
     '/'            = @{ Content = $ParHtml; Type = 'text/html; charset=utf-8' }
     '/PAR.html'    = @{ Content = $ParHtml; Type = 'text/html; charset=utf-8' }
@@ -2595,31 +3272,467 @@ catch {
         'PAR — startup failed', 'OK', 'Error') | Out-Null
     exit 1
 }
-# Background runspace serving requests, so the WPF message loop stays free.
+# Requests are handled by a small pool of runspaces (instead of one runspace
+# processing requests one at a time), so things like "Images" and "File Info"
+# — both fired the instant the detail popup opens — actually run at the same
+# time instead of queueing behind each other. A short-lived cache of report
+# folder lookups (shared across the pool) also means the two endpoints don't
+# each pay for their own separate SMB directory scan for the same report.
+$FolderCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# Resolved once up front (copies fileinfo.exe locally if needed) so every
+# pooled request just uses the cached local path instead of re-resolving
+# it — and re-hitting the share — per request.
+$FileInfoExeLocal = Get-FileInfoExeLocal
+$initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+foreach ($varDef in @(
+    @{ Name = 'Assets'           ; Value = $assets }
+    @{ Name = 'ArchiveRoots'     ; Value = $ArchiveRoots }
+    @{ Name = 'InProgressRoots'  ; Value = $InProgressRoots }
+    @{ Name = 'FolderCache'      ; Value = $FolderCache }
+    @{ Name = 'FileInfoExeLocal' ; Value = $FileInfoExeLocal }
+)) {
+    $entry = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry(
+        $varDef.Name, $varDef.Value, $null)
+    $initialSessionState.Variables.Add($entry)
+}
+$requestPool = [runspacefactory]::CreateRunspacePool(4, 12, $initialSessionState, $Host)
+$requestPool.Open()
+# The script each pooled runspace runs for a single request. Function
+# definitions are cheap to re-parse per call, so they're kept inline here
+# rather than shared, to avoid relying on pooled runspaces retaining state
+# between invocations.
+$requestScript = {
+    param($ctx)
+
+    $ImageExtensions  = @('.jpg', '.jpeg')
+    $ArchiveRootsFull = $ArchiveRoots.Values | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
+
+    function Write-JsonResponse($ctx, $obj, [int]$statusCode = 200) {
+        $json  = $obj | ConvertTo-Json -Compress -Depth 6
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $ctx.Response.StatusCode     = $statusCode
+        $ctx.Response.ContentType    = 'application/json; charset=utf-8'
+        $ctx.Response.ContentLength64 = $bytes.Length
+        $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    }
+
+    function Get-ArchiveRootForLocation($location) {
+        # Trying a single archive root for all locations instead of routing
+        # by Cebu/Manila/Default, since report folders for every location
+        # appear to live under this one share.
+        return $ArchiveRoots.Default
+    }
+
+    function Get-InProgressRootForLocation($location) {
+        # Unlike the archive share, a tech's InProgress box genuinely lives
+        # on a per-site file server, so this one does route by location.
+        if ($location -match 'cebu')   { return $InProgressRoots.Cebu }
+        if ($location -match 'manila') { return $InProgressRoots.Manila }
+        return $InProgressRoots.Default
+    }
+
+    # Known report folder prefixes: P1-P4, 1H-3H. Filtering on "<prefix>_<id>*"
+    # anchors the wildcard to the right side only, which the filesystem/SMB
+    # layer resolves much faster than a leading-wildcard "*<id>*" scan.
+    $ReportFolderPrefixes = @('P1', 'P2', 'P3', 'P4', '1H', '2H', '3H')
+
+    function Find-ReportFolders($archiveRoot, $reportId) {
+        # Reuse a recent lookup for this report if another request (e.g. the
+        # sibling images/file-info call fired at the same time) already found
+        # it, instead of re-scanning the SMB share.
+        $cacheKey = "$archiveRoot|$reportId"
+        $cached = $null
+        if ($FolderCache.TryGetValue($cacheKey, [ref]$cached) -and
+            ((Get-Date) - $cached.Time).TotalSeconds -lt 120) {
+            return $cached.Result
+        }
+        # Fastest path: try each known "<prefix>_<reportId>_..." pattern directly.
+        # A trailing-only wildcard lets the filesystem/SMB layer resolve the
+        # match immediately instead of scanning every folder name for a
+        # substring anywhere in it.
+        $result = $null
+        foreach ($prefix in $ReportFolderPrefixes) {
+            $hit = @(Get-ChildItem -LiteralPath $archiveRoot -Directory -Filter "${prefix}_${reportId}_*" -ErrorAction Stop)
+            if ($hit.Count -gt 0) {
+                $result = [pscustomobject]@{ Folders = $hit; Method = 'prefix' }
+                break
+            }
+        }
+        # Fast path: folders directly under the archive root, matched by a
+        # broader substring pattern (covers naming that doesn't match a known
+        # prefix). -Filter still pushes the wildcard down to the filesystem/
+        # SMB layer itself, so on a huge archive share the server only returns
+        # matching entries instead of us listing every folder and filtering
+        # in memory (which was slow enough on production shares to look like
+        # a dead connection).
+        if (-not $result) {
+            $direct = @(Get-ChildItem -LiteralPath $archiveRoot -Directory -Filter "*$reportId*" -ErrorAction Stop)
+            if ($direct.Count -gt 0) {
+                $result = [pscustomobject]@{ Folders = $direct; Method = 'direct' }
+            }
+        }
+        # Fallback: some archives group report folders under year/month/site
+        # subdirectories, so walk a few levels deep. Ignore per-folder access
+        # errors (permissions, offline DFS links, etc.) rather than aborting.
+        if (-not $result) {
+            $recursed = @(Get-ChildItem -LiteralPath $archiveRoot -Directory -Filter "*$reportId*" -Recurse -Depth 3 -ErrorAction SilentlyContinue)
+            $result = [pscustomobject]@{ Folders = $recursed; Method = 'recursive' }
+        }
+        $FolderCache[$cacheKey] = [pscustomobject]@{ Result = $result; Time = Get-Date }
+        return $result
+    }
+
+    function Handle-ImagesSearch($ctx) {
+        $reportId   = $ctx.Request.QueryString['reportId']
+        $location   = $ctx.Request.QueryString['location']
+        $folderName = $ctx.Request.QueryString['folderName']
+        if ([string]::IsNullOrWhiteSpace($reportId) -or ($reportId -notmatch '^[A-Za-z0-9_-]+$')) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Invalid report id' } 400
+            return
+        }
+        $archiveRoot = Get-ArchiveRootForLocation $location
+        try {
+            if (-not (Test-Path -LiteralPath $archiveRoot)) {
+                Write-JsonResponse $ctx @{ found = $false; error = "Archive share not reachable: $archiveRoot" } 502
+                return
+            }
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "Couldn't reach the archive share: $($_.Exception.Message)" } 502
+            return
+        }
+        $folder       = $null
+        $searchMethod = $null
+        # When the caller already knows the exact report folder name (e.g.
+        # a Twister .evm filename, which matches the archive folder name
+        # exactly), go straight there instead of scanning the archive share.
+        if (-not [string]::IsNullOrWhiteSpace($folderName) -and
+            ($folderName -notmatch '[\\/]') -and ($folderName -notmatch '\.\.')) {
+            $directPath = Join-Path $archiveRoot $folderName
+            try {
+                if (Test-Path -LiteralPath $directPath -PathType Container) {
+                    $folder       = Get-Item -LiteralPath $directPath
+                    $searchMethod = 'evm-filename'
+                }
+            }
+            catch { }
+        }
+        if (-not $folder) {
+            try {
+                $result  = Find-ReportFolders $archiveRoot $reportId
+                $folders = @($result.Folders | Sort-Object LastWriteTime -Descending)
+            }
+            catch {
+                Write-JsonResponse $ctx @{ found = $false; error = "Search failed: $($_.Exception.Message)" } 502
+                return
+            }
+            if ($folders.Count -eq 0) {
+                Write-JsonResponse $ctx @{
+                    found      = $false
+                    reportId   = $reportId
+                    searchRoot = $archiveRoot
+                    message    = "No archive folder found for report $reportId (searched directly under $archiveRoot and up to 3 levels deep)"
+                }
+                return
+            }
+            $folder       = $folders[0]
+            $searchMethod = $result.Method
+        }
+        $imagesDir = Join-Path $folder.FullName 'Images'
+        $imageUrls = @()
+        if (Test-Path -LiteralPath $imagesDir) {
+            try {
+                # Direction order for elevation shots: Overview, North, East, West, South.
+                $ElevationOrder = @{ 'O' = 0; 'N' = 1; 'E' = 2; 'W' = 3; 'S' = 4 }
+                $files = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction Stop |
+                         Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() } |
+                         Sort-Object LastWriteTime -Descending |
+                         Select-Object -First 5 |
+                         Sort-Object @{ Expression = {
+                             $prefix = $_.BaseName.Substring(0,1).ToUpperInvariant()
+                             if ($ElevationOrder.ContainsKey($prefix)) { $ElevationOrder[$prefix] } else { 99 }
+                         } }
+                $imageUrls = @($files | ForEach-Object { '/api/image-file?path=' + [Uri]::EscapeDataString($_.FullName) })
+            }
+            catch { }
+        }
+        Write-JsonResponse $ctx @{
+            found       = $true
+            reportId    = $reportId
+            folder      = $folder.Name
+            folderPath  = $folder.FullName
+            archiveRoot = $archiveRoot
+            searchDepth = $searchMethod
+            matchCount  = 1
+            imageCount  = $imageUrls.Count
+            images      = $imageUrls
+        }
+    }
+
+    function Handle-ImageFile($ctx) {
+        $reqPath = $ctx.Request.QueryString['path']
+        if ([string]::IsNullOrWhiteSpace($reqPath)) { $ctx.Response.StatusCode = 400; return }
+        try {
+            $full = [System.IO.Path]::GetFullPath($reqPath)
+            $withinKnownRoot = $false
+            foreach ($root in $ArchiveRootsFull) {
+                if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $withinKnownRoot = $true; break }
+            }
+            if (-not $withinKnownRoot) {
+                $ctx.Response.StatusCode = 403
+                return
+            }
+            $ext = [System.IO.Path]::GetExtension($full).ToLowerInvariant()
+            if ($ImageExtensions -notcontains $ext) { $ctx.Response.StatusCode = 403; return }
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { $ctx.Response.StatusCode = 404; return }
+            $mime = switch ($ext) {
+                '.jpg'  { 'image/jpeg' }
+                '.jpeg' { 'image/jpeg' }
+                '.png'  { 'image/png' }
+                '.gif'  { 'image/gif' }
+                '.bmp'  { 'image/bmp' }
+                '.webp' { 'image/webp' }
+                '.tif'  { 'image/tiff' }
+                '.tiff' { 'image/tiff' }
+                default { 'application/octet-stream' }
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($full)
+            $ctx.Response.ContentType     = $mime
+            $ctx.Response.ContentLength64 = $bytes.Length
+            $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        catch {
+            $ctx.Response.StatusCode = 404
+        }
+    }
+
+    function Handle-FileInfo($ctx) {
+        $reportId   = $ctx.Request.QueryString['reportId']
+        $techId     = $ctx.Request.QueryString['techId']
+        $teamNumber = $ctx.Request.QueryString['teamNumber']
+        $location   = $ctx.Request.QueryString['location']
+         $state      = $ctx.Request.QueryString['state']
+        $source     = $ctx.Request.QueryString['source']
+        if ([string]::IsNullOrWhiteSpace($reportId) -or ($reportId -notmatch '^[A-Za-z0-9_-]+$')) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Invalid report id' } 400
+            return
+        }
+        $isQc = ($source -eq 'qc')
+        # Where the .evm lives depends on source + State:
+        #  MEASURE
+        #   - "Ready To Measure": not picked up yet — fixed
+        #     "<InProgressRoot>\[TeamLead]\New".
+        #   - "Being Measured": checked out to a tech —
+        #     "<InProgressRoot>\<TechID>TCT<teamNumber>\InProgress".
+        #  QC
+        #   - "Ready For QC": not picked up yet — fixed
+        #     "<MeasuredQcRoot>\[TeamLead]\New".
+        #   - "Being Qced": checked out to a QC —
+        #     "<InProgressRoot>\<QCID>QCT<teamNumber>\InProgress".
+        if ($isQc) {
+            $isFixedFolder = ($state -match '^Ready For QC')
+        }
+        else {
+            $isFixedFolder = ($state -eq 'Ready To Measure')
+        }
+        if ($isFixedFolder) {
+            $boxDir    = '[TeamLead]'
+            $subFolder = 'New'
+        }
+        else {
+            if ([string]::IsNullOrWhiteSpace($techId) -or ($techId -notmatch '^[A-Za-z0-9]+$')) {
+                Write-JsonResponse $ctx @{ found = $false; error = ('Invalid or missing ' + $(if ($isQc) { 'QC ID' } else { 'tech ID' })) } 400
+                return
+            }
+            if ([string]::IsNullOrWhiteSpace($teamNumber) -or ($teamNumber -notmatch '^[0-9]+$')) {
+                Write-JsonResponse $ctx @{ found = $false; error = 'Invalid or missing team number' } 400
+                return
+            }
+            # QC box: "<QCID>QCT<teamNumber>". Measure box: "<TechID>TCT<teamNumber>".
+            $sep       = if ($isQc) { 'QCT' } else { 'TCT' }
+            $boxDir    = "$techId" + $sep + "$teamNumber"
+            $subFolder = 'InProgress'
+        }
+        # Which share it lives under depends on the report's Location
+        # (Cebu / Manila each have their own site file server; everything
+        # else — Bogota, etc. — falls back to the Singapore share).
+        $inProgressRoot = Get-InProgressRootForLocation $location
+        # QC "Ready For QC" .evms live under "2_Measured\QC" rather than the
+        # "1_InBox\Day Shift" InProgress root, so derive that sibling path from
+        # the same per-site base by swapping the trailing two segments.
+        if ($isQc) {
+            # All QC .evms live under "2_Measured\QC" (both the Being Qced
+            # InProgress boxes and the Ready For QC [TeamLead]\New folder),
+            # rather than the "1_InBox\Day Shift" InProgress root that Measure
+            # uses. Derive that sibling path from the same per-site base.
+            $siteBase   = Split-Path -Parent (Split-Path -Parent $inProgressRoot)
+            $searchRoot = Join-Path (Join-Path $siteBase '2_Measured') 'QC'
+        }
+        else {
+            $searchRoot = $inProgressRoot
+        }
+        $searchDir      = Join-Path (Join-Path $searchRoot $boxDir) $subFolder
+        $searchedPath   = "$boxDir\$subFolder"
+        try {
+            if (-not (Test-Path -LiteralPath $searchDir)) {
+                Write-JsonResponse $ctx @{
+                    found         = $false
+                    reportId      = $reportId
+                    techBox       = $boxDir
+                    searchedPath  = $searchedPath
+                    fullSearchDir = $searchDir
+                    message       = 'No rollback found'
+                }
+                return
+            }
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "Couldn't reach the share: $($_.Exception.Message)" } 502
+            return
+        }
+        try {
+            # File Info parses this exact .evm — it's the same file whose path
+            # is shown as "File Measured", not a separate lookup. Multiple .evm
+            # files matching the report id shouldn't normally happen in this
+            # folder, but if they do, take the most recently written one so
+            # File Info and File Measured always agree.
+            $evmFiles = @(Get-ChildItem -LiteralPath $searchDir -File -Filter "*$reportId*.evm" -ErrorAction Stop |
+                Sort-Object LastWriteTime -Descending)
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "Search failed: $($_.Exception.Message)" } 502
+            return
+        }
+        if ($evmFiles.Count -eq 0) {
+            Write-JsonResponse $ctx @{
+                found         = $false
+                reportId      = $reportId
+                techBox       = $boxDir
+                searchedPath  = $searchedPath
+                fullSearchDir = $searchDir
+                message       = 'No rollback found'
+            }
+            return
+        }
+        $evmFile = $evmFiles[0].FullName
+
+        # --- Output cache: if this exact .evm version has already been
+        # parsed (by this request or a concurrent sibling one), skip
+        # fileinfo.exe entirely. Keyed on write time so a newer .evm always
+        # gets re-parsed.
+        $evmWriteTime   = (Get-Item -LiteralPath $evmFile).LastWriteTime
+        $outputCacheKey = "out:$evmFile|$($evmWriteTime.Ticks)"
+        $cachedEntry = $null
+        if ($FolderCache.TryGetValue($outputCacheKey, [ref]$cachedEntry)) {
+            Write-JsonResponse $ctx @{
+                found    = $true
+                reportId = $reportId
+                techBox  = $boxDir
+                filePath = $evmFile
+                output   = $cachedEntry
+                cached   = $true
+            }
+            return
+        }
+
+        # fileinfo.exe is resolved once at startup and cached locally under
+        # %LOCALAPPDATA% (see Get-FileInfoExeLocal) instead of being invoked
+        # straight off the UNC share on every request — Windows previously
+        # had to pull the whole executable over SMB each time before it
+        # could even start running.
+        $fileInfoExe = $FileInfoExeLocal
+        if (-not $fileInfoExe -or -not (Test-Path -LiteralPath $fileInfoExe -PathType Leaf)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'fileinfo tool not available (local cache empty and share unreachable)' } 500
+            return
+        }
+
+        # Copy the .evm locally before handing it to fileinfo.exe, rather
+        # than pointing the tool at the UNC path directly — if the tool
+        # seeks around the file instead of reading it once sequentially,
+        # that's multiple SMB round trips per lookup instead of one copy.
+        $localEvm = Join-Path $env:TEMP ("parfi_{0}.evm" -f ([guid]::NewGuid().ToString('N')))
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $copyMs = 0; $execMs = 0
+        try {
+            Copy-Item -LiteralPath $evmFile -Destination $localEvm -Force
+            $copyMs = $sw.ElapsedMilliseconds
+            $sw.Restart()
+            $output = & $fileInfoExe $localEvm 2>&1 | Out-String
+            $execMs = $sw.ElapsedMilliseconds
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "fileinfo failed: $($_.Exception.Message)" } 500
+            return
+        }
+        finally {
+            Remove-Item -LiteralPath $localEvm -Force -ErrorAction SilentlyContinue
+        }
+        $output = $output.Trim()
+        $FolderCache[$outputCacheKey] = $output
+        Write-JsonResponse $ctx @{
+            found    = $true
+            reportId = $reportId
+            techBox  = $boxDir
+            filePath = $evmFile
+            output   = $output
+            timingMs = @{ copy = $copyMs; exec = $execMs }
+        }
+    }
+
+    try {
+        $path = $ctx.Request.Url.AbsolutePath
+        if ($path -eq '/api/images') {
+            Handle-ImagesSearch $ctx
+        }
+        elseif ($path -eq '/api/image-file') {
+            Handle-ImageFile $ctx
+        }
+        elseif ($path -eq '/api/file-info') {
+            Handle-FileInfo $ctx
+        }
+        elseif ($Assets.ContainsKey($path)) {
+            $item  = $Assets[$path]
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($item.Content)
+            $ctx.Response.ContentType     = $item.Type
+            $ctx.Response.ContentLength64 = $bytes.Length
+            $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        else {
+            $ctx.Response.StatusCode = 404
+        }
+    }
+    catch { }
+    finally { $ctx.Response.OutputStream.Close() }
+}
+# Background runspace whose only job is accepting connections and immediately
+# handing each one to the pool. Because Accept() itself is the only thing
+# happening on this runspace, a slow request (an SMB scan, running the
+# fileinfo tool) never delays accepting or starting the next one.
 $listenerRunspace = [runspacefactory]::CreateRunspace()
 $listenerRunspace.Open()
 $listenerRunspace.SessionStateProxy.SetVariable('Listener', $listener)
-$listenerRunspace.SessionStateProxy.SetVariable('Assets', $assets)
+$listenerRunspace.SessionStateProxy.SetVariable('RequestPool', $requestPool)
+$listenerRunspace.SessionStateProxy.SetVariable('RequestScript', $requestScript)
 $serverPs = [powershell]::Create()
 $serverPs.Runspace = $listenerRunspace
 [void]$serverPs.AddScript({
+    $inFlight = New-Object System.Collections.Generic.List[object]
     while ($Listener.IsListening) {
         try { $ctx = $Listener.GetContext() } catch { break }
-        try {
-            $path = $ctx.Request.Url.AbsolutePath
-            if ($Assets.ContainsKey($path)) {
-                $item  = $Assets[$path]
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($item.Content)
-                $ctx.Response.ContentType     = $item.Type
-                $ctx.Response.ContentLength64 = $bytes.Length
-                $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-            else {
-                $ctx.Response.StatusCode = 404
+        # Reap any requests that finished since the last time round, so this
+        # list doesn't grow without bound over a long-running session.
+        for ($i = $inFlight.Count - 1; $i -ge 0; $i--) {
+            if ($inFlight[$i].AsyncResult.IsCompleted) {
+                try { $inFlight[$i].Pipe.EndInvoke($inFlight[$i].AsyncResult) } catch { }
+                $inFlight[$i].Pipe.Dispose()
+                $inFlight.RemoveAt($i)
             }
         }
-        catch { }
-        finally { $ctx.Response.OutputStream.Close() }
+        $pipe = [powershell]::Create()
+        $pipe.RunspacePool = $RequestPool
+        [void]$pipe.AddScript($RequestScript).AddArgument($ctx)
+        $async = $pipe.BeginInvoke()
+        $inFlight.Add([pscustomobject]@{ Pipe = $pipe; AsyncResult = $async })
     }
 })
 $serverHandle = $serverPs.BeginInvoke()
@@ -2642,10 +3755,20 @@ $webView = New-Object Microsoft.Web.WebView2.Wpf.WebView2
 # while WebView2 spins up and the page paints for the first time.
 $webView.DefaultBackgroundColor = [System.Drawing.Color]::FromArgb(255, 14, 17, 23)
 $window.Content = $webView
+# WPF doesn't automatically hand keyboard/mouse focus down to the WebView2
+# control's embedded Chromium child window, so without this the first click
+# after the window opens (or regains focus) only activates/focuses the
+# control instead of reaching the page — the click has to be repeated to
+# actually register. Explicitly focusing WebView2 on window activation and
+# once navigation completes fixes the "needs a double click" symptom.
+$window.Add_Activated({
+    try { $webView.Focus() | Out-Null } catch { }
+})
 $window.Add_Closed({
     try { $listener.Stop() } catch { }
     try { $serverPs.Stop(); $serverPs.Dispose() } catch { }
     try { $listenerRunspace.Close() } catch { }
+    try { $requestPool.Close(); $requestPool.Dispose() } catch { }
 })
 try {
     $userDataDir = Join-Path $env:LOCALAPPDATA 'PAR-App\webview2-profile'
@@ -2667,6 +3790,7 @@ $webView.add_CoreWebView2InitializationCompleted({
     param($eventSender, $e)
     if ($e.IsSuccess) {
         $webView.CoreWebView2.Navigate($prefix)
+        try { $webView.Focus() | Out-Null } catch { }
     }
     else {
         [System.Windows.MessageBox]::Show(
