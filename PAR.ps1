@@ -34,7 +34,8 @@ Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\
 function Write-ParUsageLog {
     param(
         [string]$LogPath = "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\Logs\PAR_usage.csv",
-        [string]$Action  = 'Launch'
+        [string]$Action  = 'Launch',
+        [string]$Details = ''
     )
     try {
         $logDir = Split-Path -Path $LogPath -Parent
@@ -46,6 +47,7 @@ function Write-ParUsageLog {
             User      = $env:USERNAME
             Computer  = $env:COMPUTERNAME
             Action    = $Action
+            Details   = $Details
         }
         $writeHeader = -not (Test-Path $LogPath)
         $entry | Export-Csv -Path $LogPath -NoTypeInformation -Append:(!$writeHeader) -Force:$writeHeader -ErrorAction Stop
@@ -56,7 +58,7 @@ function Write-ParUsageLog {
         # never let a logging failure interrupt the app from starting.
         try {
             $fallback = Join-Path $env:TEMP 'PAR_usage_fallback.log'
-            Add-Content -Path $fallback -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $env:USERNAME | $env:COMPUTERNAME | $Action | LOG_ERROR: $($_.Exception.Message)" -ErrorAction SilentlyContinue
+            Add-Content -Path $fallback -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $env:USERNAME | $env:COMPUTERNAME | $Action | $Details | LOG_ERROR: $($_.Exception.Message)" -ErrorAction SilentlyContinue
         }
         catch { }
     }
@@ -68,26 +70,167 @@ Write-ParUsageLog -Action 'Launch'
 # ============================================================
 # Confirms the launching user holds role 10 (required for PAR access)
 # before the app is allowed to continue.
+#
+# >>> TEMP DEBUG: Write-ParDebug lines below print each step to the console
+#     for troubleshooting. Set $ParDebugEnabled to $true to see them again;
+#     leave $false (default) to keep the terminal quiet. <<<
+$ParDebugEnabled = $false
+function Write-ParDebug {
+    param([string]$Message, [ConsoleColor]$Color = 'Cyan')
+    if ($ParDebugEnabled) {
+        Write-Host $Message -ForegroundColor $Color
+    }
+}
 $userEmail = (whoami /upn).Trim()
-$roleApiUrl = "https://api.cmh.platform-prod2.evinternal.net/operations-center/api/UserRole?userEmail=$userEmail"
+Write-ParUsageLog -Action 'RoleCheckStart' -Details "email=$userEmail"
+Write-ParDebug "[DEBUG] userEmail = $userEmail" -Color Cyan
+
+function Get-ParUserRoleResponse {
+    param([string]$Email)
+    $url = "https://api.cmh.platform-prod2.evinternal.net/operations-center/api/UserRole?userEmail=$Email"
+    Write-ParDebug "[DEBUG] GET $url" -Color Cyan
+    Invoke-RestMethod -Uri $url -Method Get -ErrorAction Stop
+}
+
+# Reads the response body off a failed web request (Invoke-RestMethod only
+# throws on non-2xx, it doesn't give you the body directly), so we can check
+# whether the API's error message was "No user found" vs. something else.
+function Get-ParErrorResponseBody {
+    param($ErrorRecord)
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+            return $body
+        }
+        elseif ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            return $ErrorRecord.ErrorDetails.Message
+        }
+    }
+    catch { }
+    return $null
+}
+
+# Some accounts are registered with the "mnl" subdomain segment and some
+# without (james.pogio@mnl.eagleview.com <-> james.pogio@eagleview.com).
+# Toggles whichever form isn't currently in use so either direction works.
+function Get-ParAltEmail {
+    param([string]$Email)
+    if ($Email -match '@mnl\.') {
+        return $Email -replace '@mnl\.', '@'
+    }
+    else {
+        return $Email -replace '@', '@mnl.'
+    }
+}
+
+# Some accounts are registered with the "mnl" subdomain segment and some
+# without. If the API can't find the user (404 / "No user found"), retry
+# once with the alternate email form (mnl. added or stripped).
 try {
-    $roleResponse = Invoke-RestMethod -Uri $roleApiUrl -Method Get -ErrorAction Stop
+    $userRoleResponse = Get-ParUserRoleResponse -Email $userEmail
+    Write-ParDebug "[DEBUG] userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
+    Write-ParUsageLog -Action 'RoleCheckLookup' -Details "email=$userEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+
+    if ($userRoleResponse.message -and $userRoleResponse.message -match 'No user found') {
+        Write-ParDebug "[DEBUG] Initial lookup returned 'No user found' -> trying alt email" -Color Yellow
+        $fallbackEmail = Get-ParAltEmail -Email $userEmail
+        if ($fallbackEmail -ne $userEmail) {
+            Write-ParDebug "[DEBUG] fallbackEmail = $fallbackEmail" -Color Cyan
+            Write-ParUsageLog -Action 'RoleCheckFallback' -Details "original=$userEmail; fallback=$fallbackEmail"
+            $userRoleResponse = Get-ParUserRoleResponse -Email $fallbackEmail
+            Write-ParDebug "[DEBUG] fallback userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
+            Write-ParUsageLog -Action 'RoleCheckFallbackLookup' -Details "email=$fallbackEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+        }
+        else {
+            Write-ParDebug "[DEBUG] No alternate email form available -> no fallback attempted" -Color Yellow
+        }
+    }
 }
 catch {
-    Write-ParUsageLog -Action 'RoleCheckFailed'
+    $errorBody = Get-ParErrorResponseBody -ErrorRecord $_
+    Write-ParDebug "[DEBUG] EXCEPTION during UserRoleLookup: $($_.Exception.Message)" -Color Red
+    Write-ParDebug "[DEBUG] error response body = $errorBody" -Color Red
+
+    $fallbackEmail = Get-ParAltEmail -Email $userEmail
+    $shouldFallback = ($fallbackEmail -ne $userEmail) -and
+        (($_.Exception.Message -match '404') -or ($errorBody -match 'No user found'))
+
+    if ($shouldFallback) {
+        Write-ParDebug "[DEBUG] Lookup failed (404 / No user found) -> trying alt email" -Color Yellow
+        Write-ParDebug "[DEBUG] fallbackEmail = $fallbackEmail" -Color Cyan
+        Write-ParUsageLog -Action 'RoleCheckFallback' -Details "original=$userEmail; fallback=$fallbackEmail; triggerError=$($_.Exception.Message)"
+        try {
+            $userRoleResponse = Get-ParUserRoleResponse -Email $fallbackEmail
+            Write-ParDebug "[DEBUG] fallback userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
+            Write-ParUsageLog -Action 'RoleCheckFallbackLookup' -Details "email=$fallbackEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+        }
+        catch {
+            Write-ParDebug "[DEBUG] EXCEPTION during fallback UserRoleLookup: $($_.Exception.Message)" -Color Red
+            Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=UserRoleLookupFallback; email=$fallbackEmail; error=$($_.Exception.Message)"
+            [System.Windows.MessageBox]::Show(
+                "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
+                "Please check your network connection and try again, or contact PIA if this continues.",
+                'PAR — access check failed', 'OK', 'Error') | Out-Null
+            exit 1
+        }
+    }
+    else {
+        Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=UserRoleLookup; email=$userEmail; error=$($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show(
+            "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
+            "Please check your network connection and try again, or contact PIA if this continues.",
+            'PAR — access check failed', 'OK', 'Error') | Out-Null
+        exit 1
+    }
+}
+
+$userId = $userRoleResponse.userId
+Write-ParDebug "[DEBUG] userId = $userId" -Color Cyan
+if (-not $userId) {
+    Write-ParDebug "[DEBUG] FAIL: no userId in response" -Color Red
+    Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=NoUserId; email=$userEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+    [System.Windows.MessageBox]::Show(
+        "Couldn't verify your access permissions.`n`nNo user ID was returned for your account.`n`n" +
+        "Please contact PIA if this continues.",
+        'PAR — access check failed', 'OK', 'Error') | Out-Null
+    exit 1
+}
+
+$allRolesApiUrl = "https://api.cmh.platform-prod2.evinternal.net/operations-center/api/UserRole/$userId/all"
+Write-ParDebug "[DEBUG] GET $allRolesApiUrl" -Color Cyan
+try {
+    $allRolesResponse = Invoke-RestMethod -Uri $allRolesApiUrl -Method Get -ErrorAction Stop
+    Write-ParDebug "[DEBUG] allRolesResponse = $($allRolesResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
+    Write-ParUsageLog -Action 'RoleCheckAllRoles' -Details "userId=$userId; roleIds=$(($allRolesResponse | ForEach-Object { $_.roleId }) -join ',')"
+}
+catch {
+    Write-ParDebug "[DEBUG] EXCEPTION during AllRolesLookup: $($_.Exception.Message)" -Color Red
+    Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=AllRolesLookup; userId=$userId; error=$($_.Exception.Message)"
     [System.Windows.MessageBox]::Show(
         "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
         "Please check your network connection and try again, or contact PIA if this continues.",
         'PAR — access check failed', 'OK', 'Error') | Out-Null
     exit 1
 }
-if (-not $roleResponse.roles -or ($roleResponse.roles -notcontains 10)) {
-    Write-ParUsageLog -Action 'Restricted'
+
+$roleIds = $allRolesResponse | ForEach-Object { $_.roleId }
+Write-ParDebug "[DEBUG] roleIds = $($roleIds -join ',')" -Color Cyan
+Write-ParDebug "[DEBUG] has role 10? $(($roleIds -contains 10))" -Color Cyan
+if (-not $allRolesResponse -or (-not ($allRolesResponse | Where-Object { $_.roleId -eq 10 }))) {
+    Write-ParDebug "[DEBUG] RESULT: RESTRICTED (role 10 not found)" -Color Red
+    Write-ParUsageLog -Action 'Restricted' -Details "userId=$userId; email=$userEmail; roleIds=$(($allRolesResponse | ForEach-Object { $_.roleId }) -join ',')"
     [System.Windows.MessageBox]::Show(
         "Restricted`n`nContact PIA",
         'PAR — access denied', 'OK', 'Warning') | Out-Null
     exit 1
 }
+Write-ParDebug "[DEBUG] RESULT: ACCESS GRANTED" -Color Green
+
+Write-ParUsageLog -Action 'RoleCheckPassed' -Details "userId=$userId; email=$userEmail"
+# >>> END TEMP DEBUG <<<
 
 # ============================================================================
 # EMBEDDED ASSETS  (verbatim PAR.html / src/PAR.css / src/PAR.js)
@@ -123,14 +266,23 @@ PIA members: Pogi, LT, Rona
         <div class="detail-images-grid" id="detailImagesGrid"></div>
       </div>
       <div class="detail-tabs" role="tablist">
-        <button class="detail-tab active" id="detailTabOverview" data-tab="overview" role="tab" aria-selected="true">Overview</button>
-        <button class="detail-tab detail-tab-hidden" id="detailTabEvm" data-tab="evm" role="tab" aria-selected="false">EVM Data</button>
-        <button class="detail-tab" id="detailTabHistory" data-tab="history" role="tab" aria-selected="false">History</button>
+        <div class="detail-tabs-list">
+          <button class="detail-tab active" id="detailTabOverview" data-tab="overview" role="tab" aria-selected="true">Overview</button>
+          <button class="detail-tab detail-tab-hidden" id="detailTabEvm" data-tab="evm" role="tab" aria-selected="false">EVM Data</button>
+          <button class="detail-tab" id="detailTabHistory" data-tab="history" role="tab" aria-selected="false">History</button>
+        </div>
+        <div class="detail-tabs-actions">
+          <button class="detail-footer-btn" id="detailExplorerBtn" type="button">Explorer</button>
+          <button class="detail-footer-btn" id="detailGmapsBtn" type="button">Gmaps</button>
+        </div>
       </div>
       <div class="detail-modal-body" id="detailModalBody">
         <div class="detail-panel active" id="detailPanelOverview"></div>
         <div class="detail-panel" id="detailPanelEvm"></div>
         <div class="detail-panel" id="detailPanelHistory"></div>
+      </div>
+      <div class="detail-modal-footer" id="detailModalFooter">
+        <span class="detail-footer-meta" id="detailFooterMeta"></span>
       </div>
     </div>
   </div>
@@ -251,6 +403,7 @@ PIA members: Pogi, LT, Rona
           <th>Location</th>
           <th>Application</th>
           <th>Product Type</th>
+          <th>Report Details</th>
           <th>Elapsed Time</th>
           <th>Due In</th>
         </tr></thead>
@@ -330,6 +483,7 @@ PIA members: Pogi, LT, Rona
           <th>Location</th>
           <th>Application</th>
           <th>Product Type</th>
+          <th>Report Details</th>
           <th>Elapsed Time</th>
           <th>Due In</th>
         </tr></thead>
@@ -684,6 +838,8 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .par-table tbody tr[data-type="training"]       { opacity:0.65; }
 .par-table tbody tr[data-type="training"]:hover { opacity:1; border-left-color: var(--amber) !important; }
 .par-table tbody tr[data-detail-key]            { cursor:pointer; }
+.par-table tbody tr.row-detail-active            { background: var(--green-glow); border-left-color: var(--green) !important; }
+.par-table tbody tr.row-detail-active:hover      { background: var(--green-glow); }
 @keyframes rowIn { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:translateY(0)} }
 /* ── REPORT DETAIL MODAL ── */
 .detail-overlay {
@@ -695,7 +851,7 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 }
 .detail-overlay.open { opacity: 1; pointer-events: auto; }
 .detail-modal {
-  width: 640px; max-width: 92vw; height: 740px; max-height: 90vh;
+  width: 640px; max-width: 92vw; max-height: 90vh;
   background: var(--bg-base); border: 1px solid var(--border-light);
   border-radius: 10px; box-shadow: 0 12px 48px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.15);
   display: flex; flex-direction: column; overflow: hidden;
@@ -706,7 +862,7 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-modal-header {
   display: flex; align-items: flex-start; justify-content: space-between;
   padding: 16px 18px; border-bottom: 1px solid var(--border-light);
-  flex-shrink: 0;
+  background: var(--bg-surface); flex-shrink: 0;
 }
 .detail-modal-title { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-primary); }
 .detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.03em; }
@@ -719,7 +875,9 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 }
 .detail-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .detail-images-section { flex-shrink: 0; max-height: 200px; overflow-y: auto; padding: 12px 18px 0; }
-.detail-tabs { display: flex; gap: 4px; padding: 12px 18px 0; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
+.detail-tabs { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px 0; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
+.detail-tabs-list { display: flex; gap: 4px; }
+.detail-tabs-actions { display: flex; gap: 6px; margin-bottom: 8px; }
 .detail-tab {
   border: none; background: transparent; color: var(--text-secondary);
   font-family: var(--sans); font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
@@ -732,7 +890,30 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-tab-hidden { display: none !important; }
 .detail-panel { display: none; }
 .detail-panel.active { display: block; }
-.detail-modal-body { flex: 1 1 auto; min-height: 0; padding: 6px 18px 18px; overflow-y: auto; scrollbar-gutter: stable; }
+.detail-modal-body { flex: 1 1 auto; min-height: 0; padding: 6px 18px 18px; overflow-y: auto; }
+.detail-modal-footer {
+  display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+  padding: 12px 18px; border-top: 1px solid var(--border-light);
+  background: var(--bg-surface); flex-shrink: 0;
+}
+.detail-footer-meta {
+  font-size: 11px; color: var(--text-muted); letter-spacing: 0.02em;
+  margin-right: auto; font-family: var(--mono);
+}
+.detail-footer-btn {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.03em;
+  padding: 4px 10px; border-radius: 5px;
+  border: 1px solid var(--border-light); background: var(--bg-card);
+  color: var(--text-secondary); cursor: pointer;
+  transition: all 0.15s;
+}
+.detail-footer-btn:hover:not(:disabled) {
+  border-color: var(--green); color: var(--text-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+}
+.detail-footer-btn:active:not(:disabled) { transform: translateY(0); }
+.detail-footer-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .detail-section { margin-top: 16px; }
 .detail-section:first-child { margin-top: 12px; }
 .detail-section-divider { border: none; border-top: 1px solid var(--border-light); margin: 18px 0 0; }
@@ -745,13 +926,14 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
   border-bottom: 1px solid var(--border-light); font-size: 12px;
 }
 .detail-row:last-child { border-bottom: none; }
-.detail-label { flex: 0 0 140px; color: var(--text-muted); }
+.detail-label { flex: 0 0 18ch; color: var(--text-muted); }
 .detail-value { flex: 1; color: var(--text-primary); word-break: break-word; }
+.detail-value-placeholder { color: var(--text-secondary); }
 .detail-row-split { gap: 24px; }
 .detail-row-half { display: flex; gap: 10px; flex: 1 1 50%; min-width: 0; }
 .detail-row-half .detail-label { flex: 0 0 auto; }
 .detail-row-half .detail-value { flex: 1; }
-.detail-columns { display: flex; gap: 32px; }
+.detail-columns { display: flex; gap: 32px; border-bottom: 1px solid var(--border-light); padding-bottom: 5px; }
 .detail-column { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column; }
 @media (max-width: 560px) {
   .detail-columns { flex-direction: column; gap: 0; }
@@ -822,24 +1004,50 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
   font-family:var(--mono); font-size:13px;
   background-color: transparent;
 }
+/* Product Type: never wrap, regardless of table (measure col 11, qc col 10) */
+#measure-table td:nth-child(11),
+#qc-table td:nth-child(10)
+  { white-space:nowrap; }
+/* Report Details: never wrap (measure col 12, qc col 11) */
+#measure-table td:nth-child(12),
+#qc-table td:nth-child(11)
+  { white-space:nowrap; }
+/* Team: never wrap (measure col 8, qc col 7) */
+#measure-table td:nth-child(8),
+#qc-table td:nth-child(7)
+  { white-space:nowrap; }
+/* State: never wrap (measure col 4, qc col 3) */
+#measure-table td:nth-child(4),
+#qc-table td:nth-child(3)
+  { white-space:nowrap; }
+/* Rework Details: cap width so long notes/URLs wrap instead of forcing
+   the table (and page) to scroll horizontally (measure col 6 only). */
+#measure-table td:nth-child(6) {
+  max-width: 420px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 /* ── MEASURE column alignment ── */
 #measure-table td:nth-child(3),#measure-table td:nth-child(4),#measure-table td:nth-child(5),
-#measure-table td:nth-child(7),#measure-table td:nth-child(8),#measure-table td:nth-child(9),
-#measure-table td:nth-child(10)
+#measure-table td:nth-child(6),#measure-table td:nth-child(7),#measure-table td:nth-child(8),
+#measure-table td:nth-child(9),#measure-table td:nth-child(10),#measure-table td:nth-child(11),
+#measure-table td:nth-child(12)
   { text-align:left; }
 #measure-table thead th:nth-child(3),#measure-table thead th:nth-child(4),#measure-table thead th:nth-child(5),
-#measure-table thead th:nth-child(7),#measure-table thead th:nth-child(8),#measure-table thead th:nth-child(9),
-#measure-table thead th:nth-child(10)
+#measure-table thead th:nth-child(6),#measure-table thead th:nth-child(7),#measure-table thead th:nth-child(8),
+#measure-table thead th:nth-child(9),#measure-table thead th:nth-child(10),#measure-table thead th:nth-child(11),
+#measure-table thead th:nth-child(12)
   { text-align:left; }
-#measure-table thead th:nth-child(6),#measure-table td:nth-child(6) { text-align:center; }
 #measure-table td:nth-child(4),#measure-table td:nth-child(5),#measure-table td:nth-child(6),
 #measure-table td:nth-child(7),#measure-table td:nth-child(8),#measure-table td:nth-child(9) { color:var(--text-secondary); }
 /* ── QC column alignment ── */
 #qc-table td:nth-child(3),#qc-table td:nth-child(4),#qc-table td:nth-child(6),
-#qc-table td:nth-child(7),#qc-table td:nth-child(8),#qc-table td:nth-child(9)
+#qc-table td:nth-child(7),#qc-table td:nth-child(8),#qc-table td:nth-child(9),#qc-table td:nth-child(10),
+#qc-table td:nth-child(11)
   { text-align:left; }
 #qc-table thead th:nth-child(3),#qc-table thead th:nth-child(4),#qc-table thead th:nth-child(6),
-#qc-table thead th:nth-child(7),#qc-table thead th:nth-child(8),#qc-table thead th:nth-child(9)
+#qc-table thead th:nth-child(7),#qc-table thead th:nth-child(8),#qc-table thead th:nth-child(9),#qc-table thead th:nth-child(10),
+#qc-table thead th:nth-child(11)
   { text-align:left; }
 #qc-table td:nth-child(1),#qc-table td:nth-child(5),#qc-table td:nth-child(6),
 #qc-table td:nth-child(7),#qc-table td:nth-child(8) { color:var(--text-secondary); }
@@ -1537,6 +1745,14 @@ let autoReloadEnabled   = true;
 let reloadTimerInterval = null;
 let reloadTimerStarted  = false;
 let loadingDotsInterval = null;
+// Auto-reload must not arm until BOTH tables have finished their initial
+// fetch, render, and sort — otherwise whichever table happens to load
+// faster would start the 5-minute countdown while the other is still
+// mid-render.
+let m_tableReady = false, q_tableReady = false;
+function maybeStartReloadTimer(){
+  if (m_tableReady && q_tableReady && !reloadTimerStarted) startReloadTimer();
+}
 let m_fetchTrainingOnDemand = null;
 let q_fetchTrainingOnDemand = null;
 let m_trainingFetched = false;
@@ -1716,7 +1932,7 @@ function initAutoReloadCheckbox() {
   cb.addEventListener('change', e => {
     autoReloadEnabled = e.target.checked;
     localStorage.setItem('autoReloadEnabled', autoReloadEnabled);
-    if (autoReloadEnabled) startReloadTimer();
+    if (autoReloadEnabled) maybeStartReloadTimer();
     else { stopReloadTimer(); const t=document.getElementById('reloadTimer'); if(t) t.textContent='Auto Reload: DISABLED'; }
   });
 }
@@ -1760,8 +1976,17 @@ function escapeHtml(value=''){
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
-function fetchMeasureReworkDetails(reportId,locationName){
-  if(!/bogota/i.test(locationName||'')) return Promise.resolve('');
+const MEASUREMENT_REQUEST_TYPES = {
+  1: 'PSDG',
+  2: 'PSO',
+  3: 'ASOP',
+  4: 'COMM',
+  5: 'OTHER'
+};
+function getMeasurementRequestTypeName(id){
+  return MEASUREMENT_REQUEST_TYPES[id] || '';
+}
+function fetchMeasureReworkDetails(reportId){
   const jobUrl = `https://api.cmh.platform-prod.evinternal.net/inform-measures/hipster/v3/job?requester_id=${encodeURIComponent(reportId)}&source=gov`;
   return fetchJsonRetryNoHealthyUpstream(jobUrl,{},3,700)
     .then(jobData=>{
@@ -1779,6 +2004,35 @@ function fetchMeasureReworkDetails(reportId,locationName){
         });
     })
     .catch(()=>'');
+}
+// Twister equivalent of fetchMeasureReworkDetails above: instead of the
+// remote Hipster job/notes API, runs the local fileinfo.exe lookup (the
+// same one used for the EVM Data tab) and pulls its "notes" field, so
+// Twister reports with rework history also get something to show in the
+// Rework Details column / Rework Notes field.
+function fetchTwisterReworkNotes(reportId, techId, teamNumber, locationName, stateLabel, source){
+  const isQc = source === 'qc';
+  const isFixedFolder = isQc
+    ? /^Ready For QC/i.test(stateLabel || '')
+    : (stateLabel === 'Ready To Measure');
+  if (!isFixedFolder && (!techId || !teamNumber)) return Promise.resolve('');
+  const qs = new URLSearchParams({
+    reportId: String(reportId),
+    techId: String(techId || ''),
+    teamNumber: String(teamNumber || ''),
+    location: String(locationName || ''),
+    state: String(stateLabel || ''),
+    source: String(source || 'measure')
+  });
+  return fetch(`/api/file-info?${qs.toString()}`)
+    .then(r => r.json().catch(() => ({ found: false })))
+    .then(data => {
+      if (!data || !data.found) return '';
+      let parsed = null;
+      try { parsed = JSON.parse(data.output || '{}'); } catch { parsed = null; }
+      return parsed?.notes || '';
+    })
+    .catch(() => '');
 }
 /* ── SITE TAG HELPER ── */
 function extractSiteTag(entries) {
@@ -1901,7 +2155,7 @@ function startDynamicTimers(dataId){
   // two independent setIntervals each re-querying the DOM every second.
   setInterval(()=>{
     document.querySelectorAll(`#${dataId} td.elapsed`).forEach(td=>{
-      let sec=parseInt(td.dataset.seconds||'0',10); sec++; td.dataset.seconds=sec;
+      let sec=parseInt(td.dataset.seconds||'0',10); sec++; td.dataset.seconds=sec; td.dataset.sort=sec;
       const h=String(Math.floor(sec/3600)).padStart(2,'0');
       const m=String(Math.floor((sec%3600)/60)).padStart(2,'0');
       const s=String(sec%60).padStart(2,'0');
@@ -1913,7 +2167,7 @@ function startDynamicTimers(dataId){
       td.textContent=`${h}:${m}:${s}`;
     });
     document.querySelectorAll(`#${dataId} td.due`).forEach(td=>{
-      let sec=parseInt(td.dataset.seconds||'0',10); sec--; td.dataset.seconds=sec;
+      let sec=parseInt(td.dataset.seconds||'0',10); sec--; td.dataset.seconds=sec; td.dataset.sort=sec;
       const abs=Math.abs(sec);
       const h=abs>=3600?String(Math.floor(abs/3600)).padStart(2,'0'):'00';
       const m=String(Math.floor((abs%3600)/60)).padStart(2,'0');
@@ -2002,7 +2256,7 @@ function buildTimeCells(renderTime,stateTime,dueRaw,isTraining){
   const elapsedAttr=isNaN(elapsedSec)?'':elapsedSec;
   let elapsedStyle='';
   if(!isNaN(elapsedSec)&&elapsedSec>=10800&&!isTraining) elapsedStyle='style="color:red;"';
-  const elapsedCell=`<td class="elapsed" data-seconds="${elapsedAttr}" ${elapsedStyle}>${eh}:${em}:${es}</td>`;
+  const elapsedCell=`<td class="elapsed" data-seconds="${elapsedAttr}" data-sort="${isNaN(elapsedSec)?'':elapsedSec}" ${elapsedStyle}>${eh}:${em}:${es}</td>`;
   const dueMs=isNaN(dueRaw.getTime())?NaN:dueRaw.getTime()-renderTime.getTime();
   const dueSec=isNaN(dueMs)?NaN:Math.floor(dueMs/1000);
   const abs2=isNaN(dueSec)?0:Math.abs(dueSec);
@@ -2020,24 +2274,56 @@ function buildTimeCells(renderTime,stateTime,dueRaw,isTraining){
     else if(dueSec<7200)dc='orangered';
     else if(dueSec<10800)dc='DarkOrange';
   }
-  const dueCell=`<td class="due" data-seconds="${dueAttr}" style="color:${dc};">${dd}</td>`;
+  const dueCell=`<td class="due" data-seconds="${dueAttr}" data-sort="${dueAttr}" style="color:${dc};">${dd}</td>`;
   return{elapsedCell,dueCell};
 }
 /* ============================================================================
    REPORT DETAIL MODAL
    ============================================================================ */
+function highlightRow(tr){
+  tr.closest('tbody')?.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
+  tr.classList.add('row-detail-active');
+}
 function handleRowClickForDetail(e){
   const tr = e.target.closest('tr[data-detail-key]');
   if (!tr) return;
   const key = tr.dataset.detailKey;
   const details = rowDetailsStore[key];
   if (!details) return;
+  highlightRow(tr);
   openReportDetailModal(details);
 }
 function detailRow(label, value, color){
   if (value === undefined || value === null || value === '') return '';
   const style = color ? ` style="color:${color};"` : '';
   return `<div class="detail-row"><div class="detail-label">${escapeHtml(label)}</div><div class="detail-value"${style}>${value}</div></div>`;
+}
+function lockModalHeightToOverview(){
+  const overlay = document.getElementById('reportDetailOverlay');
+  const modalEl = overlay?.querySelector('.detail-modal');
+  const overviewPanel = document.getElementById('detailPanelOverview');
+  const evmPanel = document.getElementById('detailPanelEvm');
+  const historyPanel = document.getElementById('detailPanelHistory');
+  if (!modalEl || !overviewPanel) return;
+  // Measure Overview's natural height regardless of which tab is currently
+  // shown, so images loading in while the user is on another tab doesn't
+  // resize the modal out from under them.
+  const wasOverviewActive = overviewPanel.classList.contains('active');
+  const wasEvmActive = evmPanel?.classList.contains('active');
+  const wasHistoryActive = historyPanel?.classList.contains('active');
+  if (!wasOverviewActive) {
+    evmPanel?.classList.remove('active');
+    historyPanel?.classList.remove('active');
+    overviewPanel.classList.add('active');
+  }
+  modalEl.style.height = 'auto';
+  const naturalHeight = modalEl.offsetHeight;
+  modalEl.style.height = naturalHeight + 'px';
+  if (!wasOverviewActive) {
+    overviewPanel.classList.toggle('active', false);
+    if (wasEvmActive) evmPanel?.classList.add('active');
+    if (wasHistoryActive) historyPanel?.classList.add('active');
+  }
 }
 function switchDetailTab(tabName){
   document.querySelectorAll('.detail-tab').forEach(tab => {
@@ -2058,10 +2344,8 @@ function openReportDetailModal(details){
   const sub     = document.getElementById('detailModalSubtitle');
   if (!overlay || !body) return;
   const typeLabel = details.isTraining ? 'Training' : 'Live';
-  const productParts = [typeLabel, details.appLabel, details.primaryProductName, details.deliveryProductName].filter(Boolean).map(escapeHtml);
-  const productLine = productParts.length ? `<span class="detail-product-line">${productParts.join(' &nbsp;·&nbsp; ')}</span>` : '';
   title.innerHTML = `Report #${details.reportID}`;
-  sub.innerHTML = `${productLine}<div id="detailFolderName" class="detail-folder-name"></div>`;
+  sub.innerHTML = `<div id="detailFolderName" class="detail-folder-name"></div>`;
   const historyHtml = (details.history && details.history.length)
     ? `<div class="detail-timeline">${details.history.map(h => `
         <div class="detail-timeline-item">
@@ -2096,38 +2380,94 @@ function openReportDetailModal(details){
   }
   const isTwisterFileInfo = (details.source==='measure' || details.source==='qc') && details.appLabel==='Twister';
   const isHipster = details.appLabel === 'Hipster';
-  const measurementItemsHtml = escapeHtml(details.measurementItems || '').replace(/\n/g,'<br>');
-  const reworkNotesInitial = isTwisterFileInfo
-    ? 'Loading…'
-    : (isHipster ? (details.reworkHtml || '(no notes)') : '');
+  const hasReworkCount = !!(details.reworkCountHtml && String(details.reworkCountHtml).trim());
+  const fileTypeLabel = details.pmText ? 'PM' : 'Fresh';
+  const rawMeasurementItems = details.measurementItems || '';
+  const measurementItemsBase = rawMeasurementItems.replace(/\s*\[PM\]\s*$/, '');
+  const measurementItemsHtml = escapeHtml(measurementItemsBase).replace(/\n/g,'<br>');
+  let reworkNotesInitial = 'n/a';
+  let reworkNotesIsPlaceholder = true;
+  const reworkCountNum = Number(details.reworkCount) || 0;
+  const reworkNotesColor = reworkCountNum >= 1 ? 'orangered' : '';
+  if (hasReworkCount) {
+    if (isTwisterFileInfo) {
+      if (details.reworkHtml) {
+        reworkNotesInitial = details.reworkHtml;
+        reworkNotesIsPlaceholder = false;
+      } else {
+        reworkNotesInitial = 'Loading…';
+        reworkNotesIsPlaceholder = true;
+      }
+    } else if (isHipster) {
+      if (details.reworkHtml) {
+        reworkNotesInitial = details.reworkHtml;
+        reworkNotesIsPlaceholder = false;
+      } else {
+        reworkNotesInitial = '(unable to fetch Hipster operator notes)';
+        reworkNotesIsPlaceholder = true;
+      }
+    }
+  }
+  const valueOrNA = (html) => {
+    const str = (html === null || html === undefined) ? '' : String(html);
+    return str.trim() ? str : '<span class="detail-value-placeholder">n/a</span>';
+  };
   body.innerHTML = `
     <div class="detail-section">
       <div class="detail-columns">
         <div class="detail-column">
           <div class="detail-row"><div class="detail-label">Report ID</div><div class="detail-value">${details.reportID}</div></div>
-          <div class="detail-row"><div class="detail-label">State</div><div class="detail-value">${escapeHtml(details.stateLabel || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC' : 'Tech'}</div><div class="detail-value">${escapeHtml(details.userName || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC ID' : 'Tech ID'}</div><div class="detail-value">${escapeHtml(details.techUsername || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Team</div><div class="detail-value">${escapeHtml(details.team || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Location</div><div class="detail-value">${escapeHtml(details.locationName || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Rework Count</div><div class="detail-value">${details.reworkCountHtml || ''}</div></div>
-          <div class="detail-row"><div class="detail-label">Rework Notes</div><div class="detail-value" id="detailReworkNotesValue">${reworkNotesInitial}</div></div>
+          <div class="detail-row"><div class="detail-label">State</div><div class="detail-value">${valueOrNA(escapeHtml(details.stateLabel || ''))}</div></div>
+          ${details.source==='qc' ? `<div class="detail-row"><div class="detail-label">Measured By</div><div class="detail-value">${valueOrNA(escapeHtml(details.measuredTech || ''))}</div></div>` : ''}
+          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC' : 'Tech'}</div><div class="detail-value">${valueOrNA(escapeHtml(details.userName || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC ID' : 'Tech ID'}</div><div class="detail-value">${valueOrNA(escapeHtml(details.techUsername || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">Team</div><div class="detail-value">${valueOrNA(escapeHtml(details.team || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">Location</div><div class="detail-value">${valueOrNA(escapeHtml(details.locationName || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">Rework Count</div><div class="detail-value">${valueOrNA(details.reworkCountHtml)}</div></div>
+          <div class="detail-row"><div class="detail-label">Rework Notes</div><div class="detail-value${reworkNotesIsPlaceholder ? ' detail-value-placeholder' : ''}"${reworkNotesColor ? ` style="color:${reworkNotesColor};"` : ''} id="detailReworkNotesValue">${reworkNotesInitial}</div></div>
+          <div class="detail-row"><div class="detail-label">Reject History</div><div class="detail-value">${valueOrNA(details.rejectionHistoryHtml)}</div></div>
         </div>
         <div class="detail-column">
-          <div class="detail-row"><div class="detail-label">Due Date</div><div class="detail-value"${dueColor ? ` style="color:${dueColor};"` : ''}>${dueDateText}</div></div>
-          <div class="detail-row"><div class="detail-label">Last Modified</div><div class="detail-value">${!isNaN(stateTimeDate.getTime()) ? stateTimeDate.toLocaleString() : ''}</div></div>
-          <div class="detail-row"><div class="detail-label">Elapsed Time</div><div class="detail-value"${elapsedColor ? ` style="color:${elapsedColor};"` : ''}>${elapsedText}</div></div>
-          <div class="detail-row"><div class="detail-label">Product Type</div><div class="detail-value">${escapeHtml(details.primaryProductName || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Delivery Type</div><div class="detail-value">${escapeHtml(details.deliveryProductName || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Application</div><div class="detail-value">${escapeHtml(details.appLabel || '')}</div></div>
-          <div class="detail-row"><div class="detail-label">Measurement Items</div><div class="detail-value">${measurementItemsHtml}</div></div>
-          <div class="detail-row"><div class="detail-label">Rejection History</div><div class="detail-value">${details.rejectionHistoryHtml || ''}</div></div>
+          <div class="detail-row"><div class="detail-label">Due Date</div><div class="detail-value"${dueColor ? ` style="color:${dueColor};"` : ''}>${valueOrNA(dueDateText)}</div></div>
+          <div class="detail-row"><div class="detail-label">Last Modified</div><div class="detail-value">${valueOrNA(!isNaN(stateTimeDate.getTime()) ? stateTimeDate.toLocaleString() : '')}</div></div>
+          <div class="detail-row"><div class="detail-label">Elapsed Time</div><div class="detail-value"${elapsedColor ? ` style="color:${elapsedColor};"` : ''}>${valueOrNA(elapsedText)}</div></div>
+          <div class="detail-row"><div class="detail-label">Order Type</div><div class="detail-value">${valueOrNA(typeLabel)}</div></div>
+          <div class="detail-row"><div class="detail-label">Product Type</div><div class="detail-value">${valueOrNA(escapeHtml(details.primaryProductName || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">Delivery Type</div><div class="detail-value">${valueOrNA(escapeHtml(details.deliveryProductName || ''))}</div></div>
+          <div class="detail-row"><div class="detail-label">Report Details</div><div class="detail-value">${valueOrNA(escapeHtml(getMeasurementRequestTypeName(details.measurementRequestTypeID)))}</div></div>
+          <div class="detail-row"><div class="detail-label">Measurement Items</div><div class="detail-value">${valueOrNA(measurementItemsHtml)}</div></div>
         </div>
       </div>
-      ${detailRow('Measured Tech', escapeHtml(details.measuredTech || ''))}
-      ${detailRow('Rework Details', details.reworkHtml)}
+      ${details.source==='qc' ? '' : detailRow('Measured By', escapeHtml(details.measuredTech || ''))}
     </div>
   `;
+  const footerMeta = document.getElementById('detailFooterMeta');
+  if (footerMeta) {
+    footerMeta.innerHTML = valueOrNA(
+      details.appLabel ? `${escapeHtml(details.appLabel)} · ${fileTypeLabel} file` : ''
+    );
+  }
+  const explorerBtn = document.getElementById('detailExplorerBtn');
+  if (explorerBtn) {
+    const lat = Number(details.latitude);
+    const lon = Number(details.longitude);
+    const hasCoords = Number.isFinite(lat) && Number.isFinite(lon);
+    explorerBtn.disabled = !hasCoords;
+    explorerBtn.title = hasCoords ? '' : 'No coordinates available';
+    explorerBtn.onclick = hasCoords
+      ? () => window.open(`https://apps.eagleview.com/cloudexplorer#lat=${lat}&lon=${lon}&zoom=20&view=O`, '_blank', 'noopener')
+      : null;
+  }
+  const gmapsBtn = document.getElementById('detailGmapsBtn');
+  if (gmapsBtn) {
+    const addressParts = [details.address, details.city, details.addressState, details.zip].filter(Boolean);
+    const hasAddress = addressParts.length > 0;
+    gmapsBtn.disabled = !hasAddress;
+    gmapsBtn.title = hasAddress ? '' : 'No address available';
+    gmapsBtn.onclick = hasAddress
+      ? () => window.open(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addressParts.join(', '))}`, '_blank', 'noopener')
+      : null;
+  }
   const historyPanel = document.getElementById('detailPanelHistory');
   if (historyPanel) {
     historyPanel.innerHTML = `
@@ -2148,10 +2488,8 @@ function openReportDetailModal(details){
       <div class="detail-row"><div class="detail-label">${details.source==='qc' ? 'QC Time' : 'Tech Time'}</div><div class="detail-value" id="detailTechTimeValue">Loading…</div></div>
       <div class="detail-row"><div class="detail-label">Last QC</div><div class="detail-value" id="detailLastQcValue">Loading…</div></div>
       <div class="detail-row"><div class="detail-label">Notes</div><div class="detail-value" id="detailEvmNotesValue">Loading…</div></div>
-      <div class="detail-row" id="detailFileMeasuredRow">
-        <div class="detail-label">File Measured</div>
-        <div class="detail-value" id="detailFileMeasuredValue">Loading…</div>
-      </div>
+      <div class="detail-row"><div class="detail-label">Rollback</div><div class="detail-value" id="detailRollbackValue">Loading…</div></div>
+      <div class="detail-row" style="border-bottom:1px solid var(--border-light);"><div class="detail-label">Checkpoint</div><div class="detail-value" id="detailCheckpointValue">Loading…</div></div>
     </div>
   ` : '';
   }
@@ -2160,6 +2498,10 @@ function openReportDetailModal(details){
   if (imagesGrid) imagesGrid.innerHTML = buildImageSkeletons();
   if (imagesStatus) imagesStatus.textContent = 'Searching…';
   switchDetailTab('overview');
+  // Size the modal to fit the Overview tab's content with no internal
+  // scrollbar, then lock that height so switching to EVM Data/History
+  // reuses it (those panels scroll within it instead of resizing the modal).
+  lockModalHeightToOverview();
   overlay.classList.add('open');
   overlay.setAttribute('aria-hidden', 'false');
   if (isTwisterFileInfo) {
@@ -2170,7 +2512,12 @@ function openReportDetailModal(details){
     // image search with the exact folder name once it resolves; the token
     // check inside loadReportImages ensures only the latest result renders.
     loadReportImages(details.reportID, details.locationName);
-    loadFileInfo(details.reportID, details.techUsername, details.teamNumber, details.locationName, details.stateLabel, details.source);
+    // Rework Notes may already be populated from the table build
+    // (details.reworkHtml) — only ask loadFileInfo to fetch/overwrite it
+    // if we don't already have a value; the EVM Data fields still load
+    // either way.
+    const needsReworkNotesFetch = hasReworkCount && !details.reworkHtml;
+    loadFileInfo(details.reportID, details.techUsername, details.teamNumber, details.locationName, details.stateLabel, details.source, needsReworkNotesFetch);
   } else {
     loadReportImages(details.reportID, details.locationName);
   }
@@ -2212,14 +2559,16 @@ function loadReportImages(reportId, locationName, folderName){
         if (folderNameEl) folderNameEl.textContent = '';
         grid.innerHTML = `<div class="detail-images-empty">${escapeHtml((data && (data.message || data.error)) || 'No matching report folder found.')}</div>`;
       }
+      lockModalHeightToOverview();
     })
     .catch(() => {
       if (myToken !== imageLoadToken) return;
       if (status) status.textContent = '';
       grid.innerHTML = `<div class="detail-images-empty">Couldn't reach the archive share. Check your network/VPN connection.</div>`;
+      lockModalHeightToOverview();
     });
 }
-function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLabel, source){
+function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLabel, source, hasReworkCount){
   const myToken = ++fileInfoLoadToken;
   const roofEl     = document.getElementById('detailRoofValue');
   const penEl      = document.getElementById('detailPenetrationValue');
@@ -2227,11 +2576,28 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
   const techTimeEl = document.getElementById('detailTechTimeValue');
   const lastQcEl   = document.getElementById('detailLastQcValue');
   const evmNotesEl = document.getElementById('detailEvmNotesValue');
+  const rollbackEl   = document.getElementById('detailRollbackValue');
+  const checkpointEl = document.getElementById('detailCheckpointValue');
   const notesEl    = document.getElementById('detailReworkNotesValue');
-  const measuredEl = document.getElementById('detailFileMeasuredValue');
   if (!roofEl) return;
-  const fieldEls = [roofEl, penEl, wallEl, techTimeEl, lastQcEl, evmNotesEl];
-  const setFields = (text) => fieldEls.forEach(el => { if (el) el.textContent = text; });
+  const setValue = (el, text, isPlaceholder) => {
+    if (!el) return;
+    el.textContent = text;
+    el.classList.toggle('detail-value-placeholder', !!isPlaceholder);
+  };
+  const fieldEls = [roofEl, penEl, wallEl, techTimeEl, lastQcEl, evmNotesEl, rollbackEl, checkpointEl];
+  const setFields = (text, isPlaceholder) => fieldEls.forEach(el => setValue(el, text, isPlaceholder));
+  // Rework Notes shows a shorter, friendlier form of the searched-path than
+  // the raw box path (data.filePath):
+  //   "[TeamLead]\New"            -> "TeamLead"
+  //   "{tech/qc box}\InProgress"  -> "{tech/qc box}"
+  const shortenPathForNotes = (path) => {
+    if (!path) return '';
+    let s = String(path);
+    s = s.replace(/^\[(.+?)\]\\New$/i, '$1');
+    s = s.replace(/\\InProgress$/i, '');
+    return s;
+  };
   const isQc = source === 'qc';
   // The .evm's location depends on source + state:
   //  Measure — Being Measured: tech's own InProgress box (tech ID + team).
@@ -2245,14 +2611,12 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     : (stateLabel === 'Ready To Measure');
   if (!isFixedFolder && (!techUsername || !teamNumber)) {
     const message = (isQc ? 'QC ID' : 'Tech ID') + ' or team not available for this report yet.';
-    setFields(message);
-    if (notesEl) notesEl.textContent = message;
-    if (measuredEl) measuredEl.textContent = message;
+    setFields(message, true);
+    if (hasReworkCount) setValue(notesEl, message, true);
     loadReportImages(reportId, locationName);
     return;
   }
-  setFields('Loading…');
-  if (measuredEl) measuredEl.textContent = 'Loading…';
+  setFields('Loading…', true);
   const qs = new URLSearchParams({
     reportId: String(reportId),
     techId: String(techUsername || ''),
@@ -2274,24 +2638,30 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
             ? Object.keys(userTimes).find(k => k.toUpperCase().startsWith(String(techUsername).toUpperCase()))
             : null;
           const techTotalTime = techKey ? (userTimes[techKey].total_time || '') : '';
-          if (roofEl) roofEl.textContent = parsed.roof ?? '';
-          if (penEl) penEl.textContent = parsed.penetration ?? '';
-          if (wallEl) wallEl.textContent = parsed.wall ?? '';
-          if (techTimeEl) techTimeEl.textContent = techTotalTime;
-          if (lastQcEl) lastQcEl.textContent = parsed.qc ?? '';
-          if (evmNotesEl) evmNotesEl.textContent = parsed.notes ?? '';
-          if (notesEl) notesEl.textContent = parsed.notes ? parsed.notes : '(no notes)';
+          setValue(roofEl, parsed.roof ?? '', false);
+          setValue(penEl, parsed.penetration ?? '', false);
+          setValue(wallEl, parsed.wall ?? '', false);
+          setValue(techTimeEl, techTotalTime, false);
+          setValue(lastQcEl, parsed.qc || 'n/a', !parsed.qc);
+          setValue(evmNotesEl, parsed.notes || 'n/a', !parsed.notes);
+          setValue(rollbackEl, data.rollback || 'n/a', !data.rollback);
+          setValue(checkpointEl, data.checkpoint || 'n/a', !data.checkpoint);
+          if (hasReworkCount) {
+            if (parsed.notes) setValue(notesEl, parsed.notes, false);
+            else setValue(notesEl, '(no notes)', true);
+          }
         } else {
           const raw = data.output && data.output.trim() ? data.output : '(no output)';
-          if (roofEl) roofEl.textContent = '';
-          if (penEl) penEl.textContent = '';
-          if (wallEl) wallEl.textContent = '';
-          if (techTimeEl) techTimeEl.textContent = '';
-          if (lastQcEl) lastQcEl.textContent = '';
-          if (evmNotesEl) evmNotesEl.textContent = raw;
-          if (notesEl) notesEl.textContent = '(unable to parse file info)';
+          setValue(roofEl, '', false);
+          setValue(penEl, '', false);
+          setValue(wallEl, '', false);
+          setValue(techTimeEl, '', false);
+          setValue(lastQcEl, 'n/a', true);
+          setValue(evmNotesEl, raw, true);
+          setValue(rollbackEl, data.rollback || 'n/a', !data.rollback);
+          setValue(checkpointEl, data.checkpoint || 'n/a', !data.checkpoint);
+          if (hasReworkCount) setValue(notesEl, '(unable to parse file info)', true);
         }
-        if (measuredEl) measuredEl.textContent = data.filePath || '(path not returned)';
         // Twister's .evm filename (minus extension) is the exact archive
         // folder name, so go straight there instead of scanning the share.
         const evmBaseName = getEvmBaseName(data.filePath);
@@ -2304,9 +2674,11 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
         const notFoundMessage = shortPath
           ? `EVM not found in ${shortPath}`
           : ((data && (data.message || data.error)) || 'File info not available.');
-        setFields(notFoundMessage);
-        if (notesEl) notesEl.textContent = notFoundMessage;
-        if (measuredEl) measuredEl.textContent = notFoundMessage;
+        const notesNotFoundMessage = shortPath
+          ? `EVM not found in ${shortenPathForNotes(shortPath)}`
+          : notFoundMessage;
+        setFields(notFoundMessage, true);
+        if (hasReworkCount) setValue(notesEl, notesNotFoundMessage, true);
         // No filename to go on — fall back to the archive search by report ID.
         loadReportImages(reportId, locationName);
       }
@@ -2314,9 +2686,8 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     .catch(() => {
       if (myToken !== fileInfoLoadToken) return;
       const message = "Couldn't reach the local file-info service.";
-      setFields(message);
-      if (notesEl) notesEl.textContent = message;
-      if (measuredEl) measuredEl.textContent = message;
+      setFields(message, true);
+      if (hasReworkCount) setValue(notesEl, message, true);
       loadReportImages(reportId, locationName);
     });
 }
@@ -2344,6 +2715,7 @@ function closeReportDetailModal(){
   closeImageLightbox();
   imageLoadToken++;
   fileInfoLoadToken++;
+  document.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
 }
 /* ============================================================================
    MEASURE: MAIN DATA FETCH
@@ -2397,32 +2769,42 @@ let m_pendingFetches=0, m_fileCount=0;
           .then(({report,pmText,task,rejectedCounts,entries,user,mItems,deliveryProductName,primaryProductName})=>{
             const locationName=dictLocation.get(user[0]?.locationId)??'';
             const hasReworkHistory=[...rejectedCounts.keys()].some(type=>/rework/i.test(type));
+            const isHipster=(mItems.measurementItems||[]).some(m=>/hipster/i.test(m.name||''));
             if(!hasReworkHistory){
               return{report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails:'',locationName,deliveryProductName,primaryProductName};
             }
-            return fetchMeasureReworkDetails(item.reportID,locationName)
+            if(isHipster){
+              return fetchMeasureReworkDetails(item.reportID)
+                .then(reworkDetails=>({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName,deliveryProductName,primaryProductName}));
+            }
+            // Twister with rework history — pull notes from the local
+            // fileinfo.exe lookup instead of the Hipster job/notes API.
+            const techId = user[0]?.techUsername ?? '';
+            const teamNumber = dictTeam.get(user[0]?.teamId)?.teamNumber ?? '';
+            const stateLabelForFileInfo = isRTM ? 'Ready To Measure' : 'Being Measured';
+            return fetchTwisterReworkNotes(item.reportID, techId, teamNumber, locationName, stateLabelForFileInfo, 'measure')
               .then(reworkDetails=>({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName,deliveryProductName,primaryProductName}));
           })
           .then(({report,pmText,task,rejectedCounts,entries,user,mItems,reworkDetails,locationName,deliveryProductName,primaryProductName})=>{
             const mText=(mItems.measurementItems||[]).map(m=>'*'+(m.name||'').replace(/\s+/g,'')).join('  ');
+            const rowStateColor = isRTM?'var(--text-primary)':'var(--text-secondary)';
             const styleRejectedEntry=([type,count])=>{
               let color;
-              if(count>=3)      color='red';
-              else if(count===2) color='DarkOrange';
-              else               color=isRTM?'var(--text-primary)':'var(--text-secondary)';
-              return `<span style="color:${color};">${type} ${count}x</span>`;
+              if(count>=3)        color='red';
+              else if(count===2)  color='orangered';
+              else if(/rework/i.test(type)) color='orangered';
+              else                color=rowStateColor;
+              return `<span style="color:${color};white-space:nowrap;">${type} ${count}x</span>`;
             };
             const rejectedSuffix=[...rejectedCounts.entries()].map(styleRejectedEntry).join('<br>');
             const reworkTotalCount=[...rejectedCounts.entries()].filter(([type])=>/rework/i.test(type)).reduce((sum,[,count])=>sum+count,0);
-            const reworkCountHtml=reworkTotalCount?(()=>{
-              let color;
-              if(reworkTotalCount>=3)      color='red';
-              else if(reworkTotalCount===2) color='DarkOrange';
-              else                          color=isRTM?'var(--text-primary)':'var(--text-secondary)';
-              return `<span style="color:${color};">${reworkTotalCount}</span>`;
-            })():'';
-            const rejectionHistoryHtml=[...rejectedCounts.entries()].filter(([type])=>!/rework/i.test(type)).map(styleRejectedEntry).join('<br>');
-            const reworkHtml=escapeHtml(reworkDetails).replace(/\n/g,'<br>');
+            let reworkColor = 'var(--text-primary)';
+            if(reworkTotalCount>=2)       reworkColor='red';
+            else if(reworkTotalCount===1) reworkColor='orangered';
+            const reworkDetailsColor = 'orangered';
+            const reworkCountHtml=reworkTotalCount?`<span style="color:${reworkColor};">${reworkTotalCount}</span>`:'';
+            const rejectionHistoryHtml=[...rejectedCounts.entries()].map(styleRejectedEntry).join('<br>');
+            const reworkHtml=reworkTotalCount?`<span style="color:${reworkDetailsColor};">${escapeHtml(reworkDetails).replace(/\n/g,'<br>')}</span>`:escapeHtml(reworkDetails).replace(/\n/g,'<br>');
             const isHipsterErrorRow =
               /bellevue/i.test(locationName) ||
               /hipster/i.test(locationName)  ||
@@ -2448,6 +2830,13 @@ let m_pendingFetches=0, m_fileCount=0;
               locationName,
               deliveryProductName,
               primaryProductName,
+              measurementRequestTypeID:report.measurementRequestTypeID,
+              latitude:report.latitude,
+              longitude:report.longitude,
+              address:report.address,
+              city:report.city,
+              addressState:report.state,
+              zip:report.zip,
               measurementItems:(mItems.measurementItems||[]).map(m=>m.name).filter(Boolean).join('\n')+(pmText?' [PM]':''),
               stateTime:task.stateTime,
               dueDate:item.dueDate,
@@ -2464,12 +2853,13 @@ let m_pendingFetches=0, m_fileCount=0;
 <td>${user[0]?.userName??''}${siteTag}</td>
 <td style="color:${isRTM?'var(--text-primary)':'var(--text-secondary)'};">${isRTM?'Ready To Measure':'Being Measured'}</td>
 <td style="color:${isRTM?'var(--text-primary)':'var(--text-secondary)'};">${rejectedSuffix}</td>
-<td style="color:${isRTM?'var(--text-primary)':'var(--text-secondary)'};">${reworkHtml}</td>
+<td>${reworkHtml}</td>
 <td>${user[0]?.techUsername??''}</td>
 <td>${dictTeam.get(user[0]?.teamId)?.name??''}</td>
 <td>${locationName}</td>
 <td>${appLabel}</td>
-<td>${escapeHtml(primaryProductName||'')}</td>`;
+<td>${escapeHtml(primaryProductName||'')}</td>
+<td>${escapeHtml(getMeasurementRequestTypeName(report.measurementRequestTypeID))}</td>`;
             const renderTime=new Date();
             const stateTime=parseServerUtc(task.stateTime);
             const dueRaw=parseServerUtc(item.dueDate);
@@ -2481,12 +2871,12 @@ let m_pendingFetches=0, m_fileCount=0;
             applyAllFilters('m');
             initColumnVisibility('measure-table','hiddenCols_measure','m-columnControls');
             m_pendingFetches--;
-            if(m_pendingFetches===0){sortTableByColumn('measure-table',12,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(m_pendingFetches===0){sortTableByColumn('measure-table',13,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');m_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('m-data');}
           })
           .catch(err=>{
             console.error('measure report chain error:',err);
             m_pendingFetches=Math.max(0,m_pendingFetches-1);
-            if(m_pendingFetches===0){sortTableByColumn('measure-table',12,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(m_pendingFetches===0){sortTableByColumn('measure-table',13,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');m_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('m-data');}
           });
       });
     }
@@ -2502,6 +2892,10 @@ let m_pendingFetches=0, m_fileCount=0;
       fetch(apiRTMUrl).then(r=>r.ok?r.json():Promise.reject()).then(d=>processList(d,true,false)).catch(e=>console.error('apiRTMUrl:',e))
     ]).then(()=>{
       if(document.getElementById('m-chkTraining')?.classList.contains('active-training')) loadMeasureTrainingData();
+      // Safety net: if neither list returned any items, the per-row
+      // completion above never runs, so the table would never be marked
+      // ready and auto-reload would never arm. Mark it ready here instead.
+      if(m_pendingFetches===0 && !m_tableReady){sortTableByColumn('measure-table',13,true);colorDuplicateMeasureUsernames();startDynamicTimers('m-data');m_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('m-data');}
     });
   }).catch(err=>console.error('measure main chain error:',err));
 })();
@@ -2512,14 +2906,14 @@ function colorDuplicateMeasureUsernames(){
   const uC=new Map(),tC=new Map();
   rows.forEach(row=>{
     const cells=row.cells;
-    if(cells.length>=8&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
+    if(cells.length>=9&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
       const u=cells[2].textContent.trim(),t=cells[6].textContent.trim();
       if(u)uC.set(u,(uC.get(u)||0)+1); if(t)tC.set(t,(tC.get(t)||0)+1);
     }
   });
   rows.forEach(row=>{
     const cells=row.cells;
-    if(cells.length>=8&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
+    if(cells.length>=9&&cells[3].textContent.trim().includes('Being Measured')&&row.dataset.type!=='training'){
       const u=cells[2].textContent.trim(),t=cells[6].textContent.trim();
       if(u&&uC.get(u)>1)cells[2].style.color='red';
       if(t&&tC.get(t)>1)cells[6].style.color='red';
@@ -2616,11 +3010,12 @@ let q_pendingFetches=0, q_fileCount=0;
               return(match&&/rework/i.test(match[1]))?count+1:count;
             },0);
             const reworkCountHtml=reworkCount?(()=>{
-              let color;
-              if(reworkCount>=3)      color='red';
-              else if(reworkCount===2) color='DarkOrange';
-              else                     color=isRFQC?'var(--text-primary)':'var(--text-secondary)';
+              const color = reworkCount>=2 ? 'red' : 'orangered';
               return `<span style="color:${color};">${reworkCount}</span>`;
+            })():'';
+            const rejectionHistoryHtmlQC=reworkCount?(()=>{
+              const color = reworkCount>=2 ? 'red' : 'orangered';
+              return `<span style="color:${color};white-space:nowrap;">Rework ${reworkCount}x</span>`;
             })():'';
             rowDetailsStore[rowKey]={
               reportID:item.reportID,
@@ -2638,12 +3033,19 @@ let q_pendingFetches=0, q_fileCount=0;
               locationName:qcLocationName,
               deliveryProductName,
               primaryProductName,
+              measurementRequestTypeID:report.measurementRequestTypeID,
+              latitude:report.latitude,
+              longitude:report.longitude,
+              address:report.address,
+              city:report.city,
+              addressState:report.state,
+              zip:report.zip,
               measurementItems:(mItems.measurementItems||[]).map(m=>m.name).filter(Boolean).join('\n')+(pmText?' [PM]':''),
               stateTime:task.stateTime,
               dueDate:item.dueDate,
               rejectedSuffix:lastMeasuredTech?`Measured Tech: ${lastMeasuredTech}`:'',
               reworkCountHtml,
-              rejectionHistoryHtml:'',
+              rejectionHistoryHtml:rejectionHistoryHtmlQC,
               reworkHtml:'',
               history:task2Entries.map(e=>({description:e.description,stateTime:e.stateTime}))
                 .sort((a,b)=>new Date(b.stateTime)-new Date(a.stateTime))
@@ -2658,7 +3060,8 @@ let q_pendingFetches=0, q_fileCount=0;
 <td>${dictTeam.get(user[0]?.teamId)?.name??''}</td>
 <td>${dictLocation.get(user[0]?.locationId)??''}</td>
 <td>${appLabel}</td>
-<td>${escapeHtml(primaryProductName||'')}</td>`;
+<td>${escapeHtml(primaryProductName||'')}</td>
+<td>${escapeHtml(getMeasurementRequestTypeName(report.measurementRequestTypeID))}</td>`;
             const renderTime=new Date();
             const stateTime=parseServerUtc(task.stateTime);
             const dueRaw=parseServerUtc(item.dueDate);
@@ -2670,12 +3073,12 @@ let q_pendingFetches=0, q_fileCount=0;
             applyAllFilters('q');
             initColumnVisibility('qc-table','hiddenCols_qc','q-columnControls');
             q_pendingFetches--;
-            if(q_pendingFetches===0){sortTableByColumn('qc-table',11,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(q_pendingFetches===0){sortTableByColumn('qc-table',12,true);startDynamicTimers('q-data');q_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('q-data');}
           })
           .catch(err=>{
             console.error('qc report chain error:',err);
             q_pendingFetches=Math.max(0,q_pendingFetches-1);
-            if(q_pendingFetches===0){sortTableByColumn('qc-table',11,true);startDynamicTimers('q-data');if(!reloadTimerStarted)startReloadTimer();}
+            if(q_pendingFetches===0){sortTableByColumn('qc-table',12,true);startDynamicTimers('q-data');q_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('q-data');}
           });
       });
     }
@@ -2691,6 +3094,10 @@ let q_pendingFetches=0, q_fileCount=0;
       fetch(apiRFQC) .then(r=>r.ok?r.json():Promise.reject()).then(d=>processList(d,true,false)).catch(e=>console.error('apiRFQC:',e))
     ]).then(()=>{
       if(document.getElementById('q-chkTraining')?.classList.contains('active-training')) loadQcTrainingData();
+      // Safety net: if neither list returned any items, the per-row
+      // completion above never runs, so the table would never be marked
+      // ready and auto-reload would never arm. Mark it ready here instead.
+      if(q_pendingFetches===0 && !q_tableReady){sortTableByColumn('qc-table',12,true);startDynamicTimers('q-data');q_tableReady=true;maybeStartReloadTimer();window.flashDueCellsNow&&window.flashDueCellsNow('q-data');}
     });
   }).catch(err=>console.error('qc main chain error:',err));
 })();
@@ -3055,8 +3462,8 @@ let q_pendingFetches=0, q_fileCount=0;
     });
   }
   const PULSE_CONFIG = {
-    warning:  { seconds: 3600, interval: 300, cls: 'due-warning-pulse' },
-    critical: { seconds: 1800, interval: 120, cls: 'due-critical-pulse' }
+    warning:  { seconds: 3600, interval: 60, cls: 'due-warning-pulse' },
+    critical: { seconds: 1800, interval: 60, cls: 'due-critical-pulse' }
   };
   const PULSE_ANIM_DURATION = 1500;
   const cellPulseMap        = new Map();
@@ -3120,6 +3527,29 @@ let q_pendingFetches=0, q_fileCount=0;
     });
     observer.observe(tbody, { childList: true });
   }
+  // Fires the fade→peak→fade flash immediately on every currently-due cell
+  // in a table, meant to be called once the table has finished loading and
+  // been sorted (rather than waiting for the per-row appearance to trickle
+  // through the MutationObserver, or for the next scheduled 1-min tick).
+  function flashDueCellsNow(dataId) {
+    const tbody = document.getElementById(dataId);
+    if (!tbody) return;
+    tbody.querySelectorAll('tr').forEach(row => {
+      if (row.dataset.type === 'training') return;
+      const cell = row.querySelector('td.due');
+      if (!cell) return;
+      registerDueCell(cell);
+      const sec = parseInt(cell.dataset.seconds || '0', 10);
+      let level = null;
+      if (sec < PULSE_CONFIG.critical.seconds || sec < 0) level = 'critical';
+      else if (sec < PULSE_CONFIG.warning.seconds)        level = 'warning';
+      if (!level) return;
+      const state = cellPulseMap.get(cell);
+      if (state) { state.level = level; state.secondsSince = 0; }
+      triggerPulse(cell, level);
+    });
+  }
+  window.flashDueCellsNow = flashDueCellsNow;
   function initDuePulse() {
     watchTbodyForDueCells('m-data');
     watchTbodyForDueCells('q-data');
@@ -3283,6 +3713,16 @@ $FolderCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object
 # pooled request just uses the cached local path instead of re-resolving
 # it — and re-hitting the share — per request.
 $FileInfoExeLocal = Get-FileInfoExeLocal
+# fileinfo.exe writes its own intermediate file to a FIXED path in the
+# user's Temp folder while it parses (not something we control — it's
+# internal to the tool). With the request pool running several requests at
+# once, two concurrent fileinfo.exe invocations can collide on that fixed
+# filename — one process deletes/rewrites it while the other still has it
+# open, surfacing as a WinError 32 "process cannot access the file" in the
+# Notes field. A pool-wide semaphore serializes actual fileinfo.exe runs
+# (cache hits still skip it entirely) so only one instance ever touches
+# that file at a time.
+$FileInfoExeLock = [System.Threading.SemaphoreSlim]::new(1, 1)
 $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 foreach ($varDef in @(
     @{ Name = 'Assets'           ; Value = $assets }
@@ -3290,6 +3730,7 @@ foreach ($varDef in @(
     @{ Name = 'InProgressRoots'  ; Value = $InProgressRoots }
     @{ Name = 'FolderCache'      ; Value = $FolderCache }
     @{ Name = 'FileInfoExeLocal' ; Value = $FileInfoExeLocal }
+    @{ Name = 'FileInfoExeLock'  ; Value = $FileInfoExeLock }
 )) {
     $entry = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry(
         $varDef.Name, $varDef.Value, $null)
@@ -3507,78 +3948,56 @@ $requestScript = {
     }
 
     function Handle-FileInfo($ctx) {
-        $reportId   = $ctx.Request.QueryString['reportId']
-        $techId     = $ctx.Request.QueryString['techId']
-        $teamNumber = $ctx.Request.QueryString['teamNumber']
-        $location   = $ctx.Request.QueryString['location']
-         $state      = $ctx.Request.QueryString['state']
-        $source     = $ctx.Request.QueryString['source']
+        $reportId = $ctx.Request.QueryString['reportId']
+        $location = $ctx.Request.QueryString['location']
         if ([string]::IsNullOrWhiteSpace($reportId) -or ($reportId -notmatch '^[A-Za-z0-9_-]+$')) {
             Write-JsonResponse $ctx @{ found = $false; error = 'Invalid report id' } 400
             return
         }
-        $isQc = ($source -eq 'qc')
-        # Where the .evm lives depends on source + State:
-        #  MEASURE
-        #   - "Ready To Measure": not picked up yet — fixed
-        #     "<InProgressRoot>\[TeamLead]\New".
-        #   - "Being Measured": checked out to a tech —
-        #     "<InProgressRoot>\<TechID>TCT<teamNumber>\InProgress".
-        #  QC
-        #   - "Ready For QC": not picked up yet — fixed
-        #     "<MeasuredQcRoot>\[TeamLead]\New".
-        #   - "Being Qced": checked out to a QC —
-        #     "<InProgressRoot>\<QCID>QCT<teamNumber>\InProgress".
-        if ($isQc) {
-            $isFixedFolder = ($state -match '^Ready For QC')
-        }
-        else {
-            $isFixedFolder = ($state -eq 'Ready To Measure')
-        }
-        if ($isFixedFolder) {
-            $boxDir    = '[TeamLead]'
-            $subFolder = 'New'
-        }
-        else {
-            if ([string]::IsNullOrWhiteSpace($techId) -or ($techId -notmatch '^[A-Za-z0-9]+$')) {
-                Write-JsonResponse $ctx @{ found = $false; error = ('Invalid or missing ' + $(if ($isQc) { 'QC ID' } else { 'tech ID' })) } 400
+        # File Info now always reads from the report's archive folder rather
+        # than the tech/QC InProgress boxes: the working .evm the tech/QC has
+        # checked out isn't necessarily the newest version on disk, but the
+        # Rollback folder under the archive keeps every saved version, so the
+        # highest-numbered file there ("<n>.0.evm") is always the latest.
+        #   \\reports-fs-sing.cmh.reportsprod.evinternal.net\Production\archive\<folder prefix match>\Rollback\<latest .evm>
+        $archiveRoot = Get-ArchiveRootForLocation $location
+        try {
+            if (-not (Test-Path -LiteralPath $archiveRoot)) {
+                Write-JsonResponse $ctx @{ found = $false; error = "Archive share not reachable: $archiveRoot" } 502
                 return
             }
-            if ([string]::IsNullOrWhiteSpace($teamNumber) -or ($teamNumber -notmatch '^[0-9]+$')) {
-                Write-JsonResponse $ctx @{ found = $false; error = 'Invalid or missing team number' } 400
-                return
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "Couldn't reach the archive share: $($_.Exception.Message)" } 502
+            return
+        }
+        try {
+            $result  = Find-ReportFolders $archiveRoot $reportId
+            $folders = @($result.Folders | Sort-Object LastWriteTime -Descending)
+        }
+        catch {
+            Write-JsonResponse $ctx @{ found = $false; error = "Search failed: $($_.Exception.Message)" } 502
+            return
+        }
+        if ($folders.Count -eq 0) {
+            Write-JsonResponse $ctx @{
+                found      = $false
+                reportId   = $reportId
+                searchRoot = $archiveRoot
+                message    = "No archive folder found for report $reportId (searched directly under $archiveRoot and up to 3 levels deep)"
             }
-            # QC box: "<QCID>QCT<teamNumber>". Measure box: "<TechID>TCT<teamNumber>".
-            $sep       = if ($isQc) { 'QCT' } else { 'TCT' }
-            $boxDir    = "$techId" + $sep + "$teamNumber"
-            $subFolder = 'InProgress'
+            return
         }
-        # Which share it lives under depends on the report's Location
-        # (Cebu / Manila each have their own site file server; everything
-        # else — Bogota, etc. — falls back to the Singapore share).
-        $inProgressRoot = Get-InProgressRootForLocation $location
-        # QC "Ready For QC" .evms live under "2_Measured\QC" rather than the
-        # "1_InBox\Day Shift" InProgress root, so derive that sibling path from
-        # the same per-site base by swapping the trailing two segments.
-        if ($isQc) {
-            # All QC .evms live under "2_Measured\QC" (both the Being Qced
-            # InProgress boxes and the Ready For QC [TeamLead]\New folder),
-            # rather than the "1_InBox\Day Shift" InProgress root that Measure
-            # uses. Derive that sibling path from the same per-site base.
-            $siteBase   = Split-Path -Parent (Split-Path -Parent $inProgressRoot)
-            $searchRoot = Join-Path (Join-Path $siteBase '2_Measured') 'QC'
-        }
-        else {
-            $searchRoot = $inProgressRoot
-        }
-        $searchDir      = Join-Path (Join-Path $searchRoot $boxDir) $subFolder
-        $searchedPath   = "$boxDir\$subFolder"
+        $folder       = $folders[0]
+        $searchMethod = $result.Method
+        $searchDir    = Join-Path $folder.FullName 'Rollback'
+        $searchedPath = "$($folder.Name)\Rollback"
         try {
             if (-not (Test-Path -LiteralPath $searchDir)) {
                 Write-JsonResponse $ctx @{
                     found         = $false
                     reportId      = $reportId
-                    techBox       = $boxDir
+                    folder        = $folder.Name
                     searchedPath  = $searchedPath
                     fullSearchDir = $searchDir
                     message       = 'No rollback found'
@@ -3591,13 +4010,19 @@ $requestScript = {
             return
         }
         try {
-            # File Info parses this exact .evm — it's the same file whose path
-            # is shown as "File Measured", not a separate lookup. Multiple .evm
-            # files matching the report id shouldn't normally happen in this
-            # folder, but if they do, take the most recently written one so
-            # File Info and File Measured always agree.
-            $evmFiles = @(Get-ChildItem -LiteralPath $searchDir -File -Filter "*$reportId*.evm" -ErrorAction Stop |
-                Sort-Object LastWriteTime -Descending)
+            # Rollback .evm files are named "<version>.0.evm" (e.g. "1.0.evm",
+            # "2.0.evm" ... "5.0.evm"). Sort by that numeric version rather
+            # than LastWriteTime, since successive versions can land with the
+            # same/near-identical timestamp and the version number is the
+            # authoritative "latest" signal. Fall back to LastWriteTime for
+            # any file that doesn't match the expected naming.
+            $evmFiles = @(Get-ChildItem -LiteralPath $searchDir -File -Filter '*.evm' -ErrorAction Stop |
+                Sort-Object -Descending -Property @{
+                    Expression = {
+                        $ver = 0.0
+                        if ([double]::TryParse(($_.BaseName -replace '[^0-9.]', ''), [ref]$ver)) { $ver } else { -1 }
+                    }
+                }, LastWriteTime)
         }
         catch {
             Write-JsonResponse $ctx @{ found = $false; error = "Search failed: $($_.Exception.Message)" } 502
@@ -3607,7 +4032,7 @@ $requestScript = {
             Write-JsonResponse $ctx @{
                 found         = $false
                 reportId      = $reportId
-                techBox       = $boxDir
+                folder        = $folder.Name
                 searchedPath  = $searchedPath
                 fullSearchDir = $searchDir
                 message       = 'No rollback found'
@@ -3621,16 +4046,24 @@ $requestScript = {
         # fileinfo.exe entirely. Keyed on write time so a newer .evm always
         # gets re-parsed.
         $evmWriteTime   = (Get-Item -LiteralPath $evmFile).LastWriteTime
+        # "Rollback" is the version number pulled from the filename itself
+        # (e.g. "5.0.evm" -> "5.0"), not the parsed fileinfo output.
+        # "Checkpoint" is that file's last-modified time, formatted to match
+        # what Explorer shows (e.g. "8/31/2026 9:31 AM").
+        $rollbackVersion  = $evmFiles[0].BaseName
+        $checkpointStamp  = $evmWriteTime.ToString('M/d/yyyy h:mm tt')
         $outputCacheKey = "out:$evmFile|$($evmWriteTime.Ticks)"
         $cachedEntry = $null
         if ($FolderCache.TryGetValue($outputCacheKey, [ref]$cachedEntry)) {
             Write-JsonResponse $ctx @{
-                found    = $true
-                reportId = $reportId
-                techBox  = $boxDir
-                filePath = $evmFile
-                output   = $cachedEntry
-                cached   = $true
+                found      = $true
+                reportId   = $reportId
+                folder     = $folder.Name
+                filePath   = $evmFile
+                rollback   = $rollbackVersion
+                checkpoint = $checkpointStamp
+                output     = $cachedEntry
+                cached     = $true
             }
             return
         }
@@ -3653,10 +4086,15 @@ $requestScript = {
         $localEvm = Join-Path $env:TEMP ("parfi_{0}.evm" -f ([guid]::NewGuid().ToString('N')))
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $copyMs = 0; $execMs = 0
+        $lockAcquired = $false
         try {
             Copy-Item -LiteralPath $evmFile -Destination $localEvm -Force
             $copyMs = $sw.ElapsedMilliseconds
             $sw.Restart()
+            # Only one fileinfo.exe run at a time pool-wide — see
+            # $FileInfoExeLock's comment above for why.
+            $FileInfoExeLock.Wait()
+            $lockAcquired = $true
             $output = & $fileInfoExe $localEvm 2>&1 | Out-String
             $execMs = $sw.ElapsedMilliseconds
         }
@@ -3665,17 +4103,20 @@ $requestScript = {
             return
         }
         finally {
+            if ($lockAcquired) { $FileInfoExeLock.Release() | Out-Null }
             Remove-Item -LiteralPath $localEvm -Force -ErrorAction SilentlyContinue
         }
         $output = $output.Trim()
         $FolderCache[$outputCacheKey] = $output
         Write-JsonResponse $ctx @{
-            found    = $true
-            reportId = $reportId
-            techBox  = $boxDir
-            filePath = $evmFile
-            output   = $output
-            timingMs = @{ copy = $copyMs; exec = $execMs }
+            found      = $true
+            reportId   = $reportId
+            folder     = $folder.Name
+            filePath   = $evmFile
+            rollback   = $rollbackVersion
+            checkpoint = $checkpointStamp
+            output     = $output
+            timingMs   = @{ copy = $copyMs; exec = $execMs }
         }
     }
 
@@ -3791,6 +4232,15 @@ $webView.add_CoreWebView2InitializationCompleted({
     if ($e.IsSuccess) {
         $webView.CoreWebView2.Navigate($prefix)
         try { $webView.Focus() | Out-Null } catch { }
+        # Any window.open()/target="_blank" link (e.g. the Explorer and
+        # Gmaps buttons in the report detail modal) would otherwise spawn a
+        # second embedded WebView2 popup window. Intercept those requests
+        # and hand the URL to the user's actual default browser instead.
+        $webView.CoreWebView2.add_NewWindowRequested({
+            param($wvSender, $wvArgs)
+            $wvArgs.Handled = $true
+            try { Start-Process $wvArgs.Uri } catch { }
+        })
     }
     else {
         [System.Windows.MessageBox]::Show(
