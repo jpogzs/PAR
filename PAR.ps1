@@ -105,9 +105,9 @@ Write-ParUsageLog -Action 'Launch'
 # before the app is allowed to continue.
 #
 # >>> TEMP DEBUG: Write-ParDebug lines below print each step to the console
-#     for troubleshooting. Set $ParDebugEnabled to $true to see them again;
-#     leave $false (default) to keep the terminal quiet. <<<
-$ParDebugEnabled = $false
+#     for troubleshooting. Enabled by default; run PAR with -Quiet to silence
+#     them (or set $ParDebugEnabled to $false). <<<
+$ParDebugEnabled = -not $Quiet
 function Write-ParDebug {
     param([string]$Message, [ConsoleColor]$Color = 'Cyan')
     if ($ParDebugEnabled) {
@@ -258,8 +258,9 @@ if (-not $allRolesResponse -or (-not ($allRolesResponse | Where-Object { $_.role
 Write-ParDebug "[DEBUG] RESULT: ACCESS GRANTED" -Color Green
 
 Write-ParUsageLog -Action 'RoleCheckPassed' -Details "userId=$userId; email=$userEmail"
-Write-ParLog 'Access check finished - terminal logging stops here.' 'INFO' 'PAR'
-$ParLogEnabled = $false   # everything after the role check stays quiet (also passed to the request runspaces)
+Write-ParLog 'Access check finished - terminal logging stays on (run with -Quiet to silence it).' 'INFO' 'PAR'
+# Terminal logging now continues after the role check (requests, image/file-info/wireframe work,
+# python output, page errors); $ParLogEnabled is still passed to the request runspaces.
 # >>> END TEMP DEBUG <<<
 
 # ============================================================================
@@ -322,6 +323,21 @@ PIA members: Pogi, LT, Rona
     <img id="imageLightboxImg" src="" alt="Report image full size">
     <button class="image-lightbox-nav image-lightbox-next" id="imageLightboxNext" title="Next image (→)" aria-label="Next image">›</button>
     <div class="image-lightbox-caption" id="imageLightboxCaption"></div>
+  </div>
+  <div id="view3dViewer" class="image-lightbox view3d-viewer" aria-hidden="true">
+    <button class="image-lightbox-close" id="view3dClose" title="Close (Esc)" aria-label="Close">×</button>
+    <div class="view3d-toolbar">
+      <button type="button" id="view3dSpin">Auto-rotate: off</button>
+      <label class="view3d-shade" title="Shading opacity (100% = default, 0% = off)">Shading <input type="range" id="view3dShade" min="0" max="300" step="5" value="100"><span id="view3dShadeVal">100%</span></label>
+      <button type="button" id="view3dReset">Reset view</button>
+      <span class="view3d-sep" aria-hidden="true"></span>
+      <button type="button" id="view3dPts">Points: on</button>
+      <button type="button" id="view3dLbl">Pitch: on</button>
+    </div>
+    <button class="image-lightbox-nav image-lightbox-prev" id="view3dPrev" title="Previous image (←)" aria-label="Previous image">‹</button>
+    <button class="image-lightbox-nav image-lightbox-next" id="view3dNext" title="Next image (→)" aria-label="Next image">›</button>
+    <canvas id="view3dCanvas"></canvas>
+    <div class="image-lightbox-caption" id="view3dCaption">Wireframes (3D)  ·  drag to rotate  ·  right-drag to pan  ·  scroll to zoom  ·  double-click to reset</div>
   </div>
   <div class="par-tab-bar">
     <div class="tab-logo-block">
@@ -1087,6 +1103,14 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
   background-size: 200% 100%;
   animation: skeleton-shimmer 1.6s ease-in-out infinite;
 }
+.detail-wireframe-loading-status {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  padding: 5px 9px; background: transparent;
+  color: #fff; font-family: var(--sans); font-size: 11px; font-weight: 500;
+  line-height: 1.3; text-align: center; white-space: nowrap; pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+}
+body.light .detail-wireframe-loading-status { color: #1a1f2e; text-shadow: none; }
 .detail-images-empty { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0; }
 .detail-wireframe-thumb { background: #fff; }
 .detail-wireframe-thumb img { object-fit: contain; background: #fff; }
@@ -1108,7 +1132,7 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
 }
 .image-lightbox.open { opacity: 1; pointer-events: auto; }
 .image-lightbox { overflow: hidden; }
-/* Every preview image is shown at the same height (the wireframe canvas is square, so it fills this height). */
+/* Every preview image is shown at the same height. */
 .image-lightbox img {
   height: 88vh; width: auto; max-width: 94vw; object-fit: contain;
   border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5);
@@ -1130,10 +1154,29 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
   transition: background 0.12s;
 }
 .image-lightbox-nav:hover { background: rgba(255,255,255,0.24); }
+.detail-view3d-thumb { background: #fff; }
+.detail-view3d-thumb img { object-fit: contain; background: #fff; }
+.detail-view3d-thumb:hover img { transform: none; }
+.view3d-viewer canvas {
+  width: min(94vw, 1500px); height: 88vh; background: #fff; border-radius: 6px;
+  box-shadow: 0 12px 48px rgba(0,0,0,0.5); cursor: grab; touch-action: none; display: block;
+}
+.view3d-viewer canvas.dragging { cursor: grabbing; }
+.view3d-toolbar { position: absolute; top: 18px; left: 24px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 110px); z-index: 2; }
+.view3d-sep { align-self: stretch; width: 1px; margin: 2px 4px; background: rgba(255,255,255,0.35); }
+.view3d-toolbar label.view3d-shade { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.10); color: #fff; font-family: var(--sans); font-size: 12px; padding: 4px 12px; border-radius: 6px; }
+.view3d-toolbar label.view3d-shade input { width: 110px; cursor: pointer; }
+.view3d-toolbar label.view3d-shade span { min-width: 38px; text-align: right; }
+.view3d-toolbar button.off { opacity: 0.5; text-decoration: line-through; }
+.view3d-toolbar button {
+  border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.10); color: #fff;
+  font-family: var(--sans); font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+}
+.view3d-toolbar button:hover { background: rgba(255,255,255,0.24); }
 .image-lightbox-prev { left: 18px; }
 .image-lightbox-next { right: 18px; }
 .image-lightbox-caption {
-  position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+  position: absolute; bottom: 34px; left: 50%; transform: translateX(-50%);
   padding: 3px 14px; border-radius: 12px; background: rgba(0,0,0,0.6); color: #fff;
   font-family: var(--sans); font-size: 12px; letter-spacing: 0.03em; white-space: nowrap;
   pointer-events: none;
@@ -1930,11 +1973,12 @@ let q_trainingFetched = false;
 const rowDetailsStore = {};
 let imageLoadToken = 0;
 let wireframeToken = 0;
-// Generated tiles shown after the top-down image: the plain wireframe and the
-// wireframe drawn over the top-down photo.
+// Generated tiles shown after the top-down image: the wireframe drawn over the
+// top-down photo (2D) and the rotatable 3D wireframes.
 const WF_TILES = {
-  wireframe: { id: 'detailWireframeThumb', label: 'Wireframe', query: '',           cls: 'detail-wireframe-thumb', loading: 'Generating wireframe…' },
-  overlay:   { id: 'detailOverlayThumb',   label: 'Overlay',   query: '&overlay=1', cls: 'detail-overlay-thumb',   loading: 'Generating overlay…' }
+  overlay:   { id: 'detailOverlayThumb',   label: 'Overlay (2D)', query: '&overlay=1', cls: 'detail-overlay-thumb',   loading: 'Generating overlay…' },
+  // Wireframes (3D): the server returns 3D geometry (JSON); the tile shows a snapshot of it and a click opens a rotatable viewer.
+  view3d:    { id: 'detailView3dThumb',    label: 'Wireframes (3D)', query: '&view3d=1', cls: 'detail-view3d-thumb', loading: 'Generating 3D wireframes…' }
 };
 const wireframeStates = {};
 let fileInfoLoadToken = 0;
@@ -2079,6 +2123,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.target.id === 'reportDetailOverlay') closeReportDetailModal();
   });
 document.querySelector('.detail-modal')?.addEventListener('click', e => {
+    if (e.target.closest('.detail-view3d-thumb')) { const v3 = wireframeStates.view3d; if (v3 && v3.status === 'ready' && v3.src) openImageLightbox(v3.src); return; }
     const img = e.target.closest('.detail-image-thumb img');
     if (img && img.getAttribute('src')) openImageLightbox(img.getAttribute('src'));
 });
@@ -2086,6 +2131,7 @@ document.querySelector('.detail-modal')?.addEventListener('click', e => {
     tab.addEventListener('click', () => switchDetailTab(tab.dataset.tab));
   });
   document.getElementById('imageLightboxClose')?.addEventListener('click', closeImageLightbox);
+  wireView3dViewer();
   (function wireLightboxZoom(){
     const lbEl  = document.getElementById('imageLightbox');
     const imgEl = document.getElementById('imageLightboxImg');
@@ -2133,6 +2179,8 @@ document.querySelector('.detail-modal')?.addEventListener('click', e => {
       return;
     }
     if (e.key !== 'Escape') return;
+    const v3 = document.getElementById('view3dViewer');
+    if (v3 && v3.classList.contains('open')) { closeView3dViewer(); return; }
     if (lightboxOpen) closeImageLightbox();
     else closeReportDetailModal();
   });
@@ -2759,8 +2807,9 @@ function openReportDetailModal(details){
   const imagesStatus = document.getElementById('detailImagesStatus');
   resetWireframe();
   if (isTwisterFileInfo) markWireframePending();
+  else if (isHipster) setWireframeUnavailable('No evm data for this Hipster report');
   if (imagesGrid) imagesGrid.innerHTML = buildImageSkeletons();
-  if (isTwisterFileInfo) renderWireframeThumb();
+  if (isTwisterFileInfo || isHipster) renderWireframeThumb();
   if (imagesStatus) imagesStatus.textContent = 'Searching…';
   switchDetailTab('overview');
   // Size the modal to fit the Overview tab's content with no internal
@@ -3004,8 +3053,8 @@ async function copyTextToClipboard(text){
   });
 })();
 function buildImageSkeletons(count = 4){
-  // Same layout as the loaded grid: Ortho (top) first, then 4 photo slots. The Wireframe and
-  // Overlay placeholders are inserted after the Ortho slot by renderWireframeThumb().
+  // Same layout as the loaded grid: Ortho (top) first, then 4 photo slots. The Overlay (2D) and
+  // Wireframes (3D) placeholders are inserted after the Ortho slot by renderWireframeThumb().
   const ortho = `<div class="detail-image-thumb detail-feature-thumb detail-topdown-thumb detail-image-skel" title="Loading top-down image…"><span class="detail-wireframe-badge">Ortho (top)</span></div>`;
   return ortho + Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
 }
@@ -3030,9 +3079,14 @@ function resetWireframe(){
     if (el) el.remove();
   });
 }
-// Twister reports: show Wireframe/Overlay placeholder boxes right away (before the EVM is located).
+// Twister reports: show Overlay (2D) / Wireframes (3D) placeholder boxes right away (before the EVM is located).
 function markWireframePending(){
   Object.keys(WF_TILES).forEach(kind => { wireframeStates[kind] = { status: 'pending', src: null, error: '', detail: '' }; });
+}
+function setWireframeUnavailable(reason){
+  Object.keys(WF_TILES).forEach(kind => {
+    wireframeStates[kind] = { status: 'error', src: null, error: reason, detail: '' };
+  });
 }
 // If the EVM can't be found, turn any still-pending placeholder into an "unavailable" tile.
 function settleWireframe(reason){
@@ -3062,15 +3116,15 @@ function renderWireframeThumb(){
     if (st.status === 'loading' || st.status === 'pending') {
       el.className = 'detail-image-thumb detail-feature-thumb detail-image-skel';
       el.title = cfg.loading;
-      el.innerHTML = `<span class="detail-wireframe-badge">${cfg.label}</span>`;
+      el.innerHTML = `<span class="detail-wireframe-badge">${cfg.label}</span><span class="detail-wireframe-loading-status" role="status" aria-live="polite">${cfg.loading}</span>`;
     } else if (st.status === 'error') {
-      el.className = 'detail-image-thumb detail-wireframe-error';
+      el.className = 'detail-image-thumb detail-feature-thumb detail-wireframe-error';
       el.title = st.detail || st.error || (cfg.label + ' unavailable');
       const reason = String(st.error || '');
       el.innerHTML = `<div><div>${cfg.label} unavailable</div><div class="detail-wireframe-reason">${escapeHtml(reason.length > 90 ? reason.slice(0, 90) + '…' : reason)}</div></div>`;
     } else {
       el.className = `detail-image-thumb detail-feature-thumb ${cfg.cls}`;
-      el.title = cfg.label;
+      el.title = kind === 'view3d' ? 'Wireframes (3D) - click to open and rotate' : cfg.label;
       el.innerHTML = `<img src="${st.src}" alt="${cfg.label}"><span class="detail-wireframe-badge">${cfg.label}</span>`;
     }
   });
@@ -3090,6 +3144,7 @@ function startWireframe(evmPath){
       .then(r => {
         const type = r.headers.get('content-type') || '';
         if (r.ok && type.startsWith('image/')) return r.blob().then(b => ({ blob: b }));
+        if (r.ok && kind === 'view3d' && type.includes('json')) return r.json().then(g => ({ geo: g }));
         return r.json().catch(() => ({})).then(j => ({
           error: (j && (j.error || j.message)) || `HTTP ${r.status}`,
           detail: (j && j.detail) || '',
@@ -3099,6 +3154,12 @@ function startWireframe(evmPath){
       .then(res => {
         if (myToken !== wireframeToken) return;
         if (res.blob) wireframeStates[kind] = { status: 'ready', src: URL.createObjectURL(res.blob), error: '', detail: '' };
+        else if (res.geo) {
+          let snap = '';
+          try { snap = render3dSnapshot(res.geo); } catch {}
+          if (snap && res.geo.P && res.geo.P.length) wireframeStates[kind] = { status: 'ready', src: snap, geo: res.geo, error: '', detail: '' };
+          else wireframeStates[kind] = { status: 'error', src: null, error: 'No 3D geometry in this EVM', detail: '' };
+        }
         else if (res.code === 'no-topdown') wireframeStates[kind] = { status: 'idle', src: null, error: '', detail: '' };
         else wireframeStates[kind] = { status: 'error', src: null, error: res.error, detail: res.detail || '' };
         {
@@ -3132,7 +3193,7 @@ function loadReportImages(reportId, locationName, folderName){
         if (folderNameEl) folderNameEl.textContent = data.folder || '';
         // Top-down (O_****_**.jpg) is featured first; the wireframe tile is
         // inserted right after it (see renderWireframeThumb), then the rest.
-        // Each photo gets a badge like the Wireframe/Overlay tiles: Ortho (top), North, East, West, South.
+        // Each photo gets a badge like the Overlay (2D) / Wireframes (3D) tiles: Ortho (top), North, East, West, South.
         const imageLabels = Array.isArray(data.imageLabels) ? data.imageLabels : [];
         grid.innerHTML = data.images.map((src, idx) => {
           const isTop = !!data.topDown && src === data.topDown;
@@ -3293,9 +3354,188 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
       loadReportImages(reportId, locationName);
     });
 }
+/* Wireframes (3D): rotatable wireframe drawn on a canvas from the geometry the server sends
+   ({P: points, S: [i, j, segmentCode], colors, names}). Z is up; drag rotates, wheel zooms. */
+/* Default = top-down, same orientation as the top-down wireframe image (x right, y down). */
+const VIEW3D_DEFAULT = { yaw: 0, pitch: -Math.PI / 2, zoom: 1 };
+const VIEW3D_DASHED = new Set(['StepFlashing', 'Rake', 'Valley', 'Hip']);
+/* Facet-type flags the viewer can hide (Facets[].Type bits; a facet like Roof+Object+Hole = 672 is hidden if any of its flags is off). */
+const VIEW3D_FLAGS = [['Hole', 32], ['Obstruction', 64], ['Object', 128], ['External', 256], ['Roof', 512], ['Wall', 1024], ['Floor', 2048], ['Unknown', 4096], ['Surface', 8192], ['Material', 16384]];
+let view3dState = { geo: null, yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch, zoom: 1, panX: 0, panY: 0, hide: 0, shade: 1, auto: false, pts: true, labels: true, raf: 0 };
+function view3dNormalize(geo){
+  if (geo._q) return geo._q;
+  const P = geo.P, lo = [0, 1, 2].map(k => Math.min(...P.map(p => p[k]))), hi = [0, 1, 2].map(k => Math.max(...P.map(p => p[k])));
+  const c = lo.map((v, k) => (v + hi[k]) / 2), R = Math.max(...hi.map((v, k) => v - lo[k]), 1e-6) / 2;
+  const nrm = p => [(p[0] - c[0]) / R, (p[1] - c[1]) / R, (p[2] - c[2]) / R];
+  geo._q = P.map(nrm);
+  geo._ql = (geo.F || []).map(f => nrm(f.l));   // pitch label positions, same normalisation
+  return geo._q;
+}
+function drawView3d(ctx, w, h, geo, v, dpr){
+  const Q = view3dNormalize(geo);
+  const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw), cp = Math.cos(v.pitch), sp = Math.sin(v.pitch);
+  const sc = Math.min(w, h) * 0.42 * v.zoom;
+  const proj = p => {
+    const x = p[0] * cy - p[1] * sy, y = p[0] * sy + p[1] * cy, z = p[2];
+    return [w / 2 + (v.panX || 0) * dpr + x * sc, h / 2 + (v.panY || 0) * dpr - (y * sp + z * cp) * sc, y * cp - z * sp];
+  };
+  const T = Q.map(proj);
+  const hide = v.hide || 0;
+  // A segment stays visible if it has no facet, or any facet using it has none of the hidden flags (shared edges stay).
+  const segVisible = s => { if (!hide) return true; const fts = s[3]; return !fts || !fts.length || fts.some(t => (t & hide) === 0); };
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  ctx.lineCap = 'round'; ctx.lineWidth = 1.8 * dpr;
+  // Material shading: facet outlines filled with their material colour (semi-transparent), far ones first.
+  const sk = v.shade == null ? 1 : +v.shade;   // Shading slider: scales every fill's opacity (0 = off)
+  if (sk > 0 && geo.A && geo.A.length) {
+    const mc = geo.mat || {};
+    // Floor facets (2048) get no shading; Roof (512) and Surface (8192) facets get a tint over the material colour.
+    const polys = geo.A.filter(a => (mc[a[0]] || (a[1] & (32 | 512 | 8192))) && !(a[1] & 2048) && !(hide && (a[1] & hide)))
+      .map(a => ({ a, d: a[2].reduce((sum, i) => sum + T[i][2], 0) / a[2].length }))
+      .sort((p, q) => q.d - p.d);
+    const matAs = geo.matAlphas || {}, roofA = geo.roofAlpha == null ? 0.25 : geo.roofAlpha, surfA = geo.surfAlpha == null ? 0.25 : geo.surfAlpha, holeA = geo.holeAlpha == null ? 0.25 : geo.holeAlpha;
+    const al = x => Math.min(1, x * sk);
+    const path = a => { ctx.beginPath(); a[2].forEach((i, k) => k ? ctx.lineTo(T[i][0], T[i][1]) : ctx.moveTo(T[i][0], T[i][1])); ctx.closePath(); };
+    polys.forEach(({ a }) => {
+      if (mc[a[0]]) { ctx.globalAlpha = al(matAs[a[0]] == null ? 0.25 : matAs[a[0]]); ctx.fillStyle = mc[a[0]]; path(a); ctx.fill(); }
+      if (a[1] & 512) { ctx.globalAlpha = al(roofA); ctx.fillStyle = geo.roof || '#a8f5a8'; path(a); ctx.fill(); }   // Roof tint
+      if (a[1] & 8192) { ctx.globalAlpha = al(surfA); ctx.fillStyle = geo.surf || '#f224e8'; path(a); ctx.fill(); }   // Surface tint
+      if (a[1] & 32) { ctx.globalAlpha = al(holeA); ctx.fillStyle = geo.hole || '#808080'; path(a); ctx.fill(); }   // Hole: gray, on top
+    });
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+  }
+  geo.S.forEach(s => {
+    if (!segVisible(s)) return;
+    let [a, b, code] = s;
+    // Floor outline (a segment of a visible Floor facet, flag 2048): gray dotted, like unspecified lines.
+    const isFloor = !(hide & 2048) && (s[3] || []).some(t => (t & 2048) !== 0);
+    if (isFloor) code = 0;
+    // Hole outline (a segment of a visible Hole facet, flag 32): solid gray.
+    const isHole = !isFloor && !(hide & 32) && (s[3] || []).some(t => (t & 32) !== 0);
+    const depth = (T[a][2] + T[b][2]) / 2;
+    const name = (geo.names || {})[code];
+    ctx.strokeStyle = isHole ? (geo.hole || '#808080') : ((geo.colors || {})[code] || '#808080');
+    ctx.globalAlpha = Math.max(0.35, Math.min(1, (code === 0 ? 0.6 : 1) - 0.25 * depth));
+    ctx.setLineDash(code === 0 ? [2 * dpr, 3 * dpr] : (!isHole && VIEW3D_DASHED.has(name) ? [6 * dpr, 4 * dpr] : []));
+    ctx.beginPath(); ctx.moveTo(T[a][0], T[a][1]); ctx.lineTo(T[b][0], T[b][1]); ctx.stroke();
+  });
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+  let ptShown = null;
+  if (hide) { ptShown = new Set(); geo.S.forEach(s => { if (segVisible(s)) { ptShown.add(s[0]); ptShown.add(s[1]); } }); }
+  if (v.pts) { ctx.fillStyle = '#0a4d8c'; T.forEach((t, i) => { if (ptShown && !ptShown.has(i)) return; ctx.beginPath(); ctx.arc(t[0], t[1], 2.4 * dpr, 0, 6.2832); ctx.fill(); }); }
+  if (v.labels && geo._ql && geo._ql.length) {
+    // Pitch label on each finite-pitch facet (none for infinite pitch); a white halo keeps it readable over the lines.
+    ctx.font = 'bold ' + Math.round(Math.max(10, Math.min(24, 12 * v.zoom)) * dpr) + 'px Arial, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 3.5 * dpr; ctx.strokeStyle = '#fff'; ctx.fillStyle = '#0a4d8c';
+    geo._ql.forEach((p, i) => { if (hide && (geo.F[i].t & hide)) return; const t = proj(p); ctx.strokeText(geo.F[i].p, t[0], t[1]); ctx.fillText(geo.F[i].p, t[0], t[1]); });
+  }
+}
+// Small still of the default view, used as the tile image.
+function render3dSnapshot(geo){
+  const cv = document.createElement('canvas');
+  cv.width = 800; cv.height = 600;
+  drawView3d(cv.getContext('2d'), cv.width, cv.height, geo, { yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch, zoom: 1, pts: false, labels: true }, 1.5);
+  return cv.toDataURL('image/png');
+}
+function view3dRedraw(){
+  const cv = document.getElementById('view3dCanvas');
+  if (!cv || !view3dState.geo) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  drawView3d(cv.getContext('2d'), w, h, view3dState.geo, view3dState, dpr);
+}
+function view3dLoop(){
+  const st = view3dState;
+  if (st.auto) { st.yaw += 0.006; view3dRedraw(); }
+  st.raf = requestAnimationFrame(view3dLoop);
+}
+// One on/off button per facet-type flag that occurs in this model, placed before "Reset view".
+function view3dBuildFlagButtons(geo){
+  const bar = document.querySelector('.view3d-toolbar');
+  if (!bar) return;
+  bar.querySelectorAll('.view3d-flag').forEach(b => b.remove());
+  const types = new Set();
+  (geo.S || []).forEach(s => (s[3] || []).forEach(t => types.add(t)));
+  (geo.F || []).forEach(f => types.add(f.t || 0));
+  VIEW3D_FLAGS.forEach(([name, bit]) => {
+    if (![...types].some(t => t & bit)) return;
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'view3d-flag'; b.textContent = name + ': on'; b.title = 'Show/hide ' + name + ' facets';
+    b.addEventListener('click', () => {
+      view3dState.hide ^= bit;
+      const off = (view3dState.hide & bit) !== 0;
+      b.textContent = name + ': ' + (off ? 'off' : 'on'); b.classList.toggle('off', off);
+      view3dRedraw();
+    });
+    bar.appendChild(b);
+  });
+}
+function openView3dViewer(){
+  const st = wireframeStates.view3d;
+  const el = document.getElementById('view3dViewer');
+  if (!el || !st || st.status !== 'ready' || !st.geo) return;
+  Object.assign(view3dState, { geo: st.geo, yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch, zoom: 1, panX: 0, panY: 0, hide: 0, shade: 1, auto: false });
+  document.getElementById('view3dSpin').textContent = 'Auto-rotate: off';
+  { const sl = document.getElementById('view3dShade'), sv = document.getElementById('view3dShadeVal'); if (sl) sl.value = 100; if (sv) sv.textContent = '100%'; }
+  view3dBuildFlagButtons(st.geo);
+  el.classList.add('open'); el.setAttribute('aria-hidden', 'false');
+  view3dRedraw();
+  if (!view3dState.raf) view3dLoop();
+  parLog('info', `Wireframes (3D) opened (${st.geo.P.length} points, ${st.geo.S.length} segments)`);
+}
+function closeView3dViewer(){ hideView3dViewer(); closeImageLightbox(); }
+function hideView3dViewer(){
+  const el = document.getElementById('view3dViewer');
+  if (!el) return;
+  el.classList.remove('open'); el.setAttribute('aria-hidden', 'true');
+  if (view3dState.raf) { cancelAnimationFrame(view3dState.raf); view3dState.raf = 0; }
+}
+function wireView3dViewer(){
+  const el = document.getElementById('view3dViewer'), cv = document.getElementById('view3dCanvas');
+  if (!el || !cv) return;
+  const st = view3dState, pointers = new Map();
+  let last = null, pinch = 0;
+  document.getElementById('view3dClose')?.addEventListener('click', closeView3dViewer);
+  document.getElementById('view3dPrev')?.addEventListener('click', () => stepImageLightbox(-1));
+  document.getElementById('view3dNext')?.addEventListener('click', () => stepImageLightbox(1));
+  // Right-drag pans here: block the native menu and the page's Refresh menu (stopPropagation keeps it from the document-level handler).
+  el.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+  el.addEventListener('click', e => { if (e.target === el) closeView3dViewer(); });
+  document.getElementById('view3dSpin')?.addEventListener('click', e => { st.auto = !st.auto; e.currentTarget.textContent = 'Auto-rotate: ' + (st.auto ? 'on' : 'off'); });
+  document.getElementById('view3dPts')?.addEventListener('click', e => { st.pts = !st.pts; e.currentTarget.textContent = 'Points: ' + (st.pts ? 'on' : 'off'); view3dRedraw(); });
+  document.getElementById('view3dShade')?.addEventListener('input', e => { st.shade = e.currentTarget.value / 100; const sv = document.getElementById('view3dShadeVal'); if (sv) sv.textContent = e.currentTarget.value + '%'; view3dRedraw(); });
+  document.getElementById('view3dLbl')?.addEventListener('click', e => { st.labels = !st.labels; e.currentTarget.textContent = 'Pitch: ' + (st.labels ? 'on' : 'off'); view3dRedraw(); });
+  const reset = () => { st.yaw = VIEW3D_DEFAULT.yaw; st.pitch = VIEW3D_DEFAULT.pitch; st.zoom = 1; st.panX = 0; st.panY = 0; view3dRedraw(); };
+  document.getElementById('view3dReset')?.addEventListener('click', reset);
+  cv.addEventListener('dblclick', reset);
+  let panning = false;   // true while the right mouse button is held
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]); last = [e.clientX, e.clientY]; panning = e.button === 2; cv.classList.add('dragging'); });
+  cv.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      if (pinch) st.zoom = Math.min(8, Math.max(0.3, st.zoom * d / pinch));
+      pinch = d; view3dRedraw(); return;
+    }
+    if (panning) { st.panX += e.clientX - last[0]; st.panY += e.clientY - last[1]; }
+    else {
+      st.yaw -= (e.clientX - last[0]) * 0.008;   // inverted: model turns opposite to the mouse
+      st.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, st.pitch - (e.clientY - last[1]) * 0.008));
+    }
+    last = [e.clientX, e.clientY]; view3dRedraw();
+  });
+  const up = e => { pointers.delete(e.pointerId); pinch = 0; last = pointers.size ? [...pointers.values()][0] : null; if (!pointers.size) cv.classList.remove('dragging'); };
+  cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+  cv.addEventListener('wheel', e => { e.preventDefault(); st.zoom = Math.min(8, Math.max(0.3, st.zoom * Math.exp(-e.deltaY * 0.0015))); view3dRedraw(); }, { passive: false });
+  window.addEventListener('resize', () => { if (el.classList.contains('open')) view3dRedraw(); });
+}
 /* Image preview (lightbox). Left/Right arrow keys (or the on-screen < > buttons) step through
    every visible tile of the Images grid in grid order, wrapping around:
-   Ortho (top) -> Wireframe -> Overlay -> North -> East -> West -> South. */
+   Ortho (top) -> Overlay (2D) -> North -> East -> West -> South.
+   (The Wireframes (3D) tile opens its own rotatable viewer and is not part of this sequence.) */
 let lightboxSrc = '';
 let lightboxIndex = 0;
 function getLightboxItems(){
@@ -3305,7 +3545,7 @@ function getLightboxItems(){
     .filter(img => img.getAttribute('src'))
     .map(img => {
       const badge = img.parentElement && img.parentElement.querySelector('.detail-wireframe-badge');
-      return { src: img.getAttribute('src'), label: badge ? badge.textContent.trim() : '' };
+      return { src: img.getAttribute('src'), label: badge ? badge.textContent.trim() : '', is3d: !!img.closest('.detail-view3d-thumb') };
     });
 }
 function showLightboxItem(item, index, total){
@@ -3315,6 +3555,7 @@ function showLightboxItem(item, index, total){
   lightboxSrc = item.src;
   lightboxIndex = index;
   resetLightboxZoom();
+  if (item.is3d) openView3dViewer(); else hideView3dViewer();   // 3D view is shown on top of the preview
   img.src = item.src;
   img.alt = item.label || 'Report image full size';
   if (cap) {
@@ -3323,6 +3564,10 @@ function showLightboxItem(item, index, total){
     if (total > 1) parts.push(`${index + 1} / ${total}`);
     cap.textContent = parts.join('  ·  ');
     cap.style.display = parts.length ? '' : 'none';
+  }
+  if (item.is3d) {
+    const cap3 = document.getElementById('view3dCaption');
+    if (cap3) cap3.textContent = 'Wireframes (3D)  ·  drag to rotate  ·  right-drag to pan  ·  scroll to zoom  ·  double-click to reset' + (total > 1 ? `  ·  ${index + 1} / ${total}` : '');
   }
   document.querySelectorAll('.image-lightbox-nav').forEach(b => { b.style.display = total > 1 ? '' : 'none'; });
 }
@@ -3355,6 +3600,7 @@ function closeImageLightbox(){
   if (!lb) return;
   lb.classList.remove('open');
   lb.setAttribute('aria-hidden', 'true');
+  hideView3dViewer();
   lightboxSrc = '';
   resetLightboxZoom();
   const img = document.getElementById('imageLightboxImg');
@@ -4492,8 +4738,13 @@ Usage:
     python roof_wireframe.py job.evm -o overlay.png --overlay O_1234_01.jpg
     python roof_wireframe.py job.evm -v        # extra (debug) logging
     python roof_wireframe.py job.evm -q        # warnings/errors only
+    python roof_wireframe.py job.evm --json3d -o job_3d.json   # 3D geometry for the PAR "3D View" tile
 
 Progress is logged to the terminal (stdout) with timestamps.
+
+--json3d writes the 3D geometry (points + typed segments + a pitch label per facet,
+Z reversed so the roof sits upright) as JSON instead of a PNG. Unlike the top-down
+image it keeps the edges of facets with an infinite pitch (but gives them no label); PAR renders it as a rotatable 3D view.
 
 --overlay draws the wireframe on top of the given top-down photo. The model
 units are image pixels (Units == 'pixels', ImageData[0] has a ~identity
@@ -4504,6 +4755,7 @@ photo was exported at a different resolution than the tool's working image, use
 Requires: numpy, scipy, matplotlib
 """
 import argparse
+import json
 import logging
 import sys
 import time
@@ -4522,35 +4774,76 @@ log = logging.getLogger("roof_wireframe")
 # (same codes as SegmentLabels.Style). Mapping inferred from the file's geometry.
 SEG_NAMES = {0: "Unspecified", 19: "Parapet", 18: "Flashing", 17: "StepFlashing", 16: "Rake",
              15: "Eave", 14: "Valley", 13: "Ridge", 12: "Hip", 11: "Other",
-             10: "Hidden"}
+             10: "Hidden", 64: "Inside Corner", 65: "Outside Corner",
+             66: "Obtuse Inside Corner", 67: "Obtuse Outside Corner", 68: "Top Wall", 69: "Bottom Wall",
+             70: "Material Horizontal Boundary", 71: "Material Vertical Boundary",
+             72: "Material Oblique Boundary", 73: "Material Top", 74: "Material Bottom",
+             75: "Material Inside Corner", 76: "Material Outside Corner",
+             77: "Material Obtuse Inside Corner", 78: "Material Obtuse Outside Corner",
+             100: "Isoline"}
 SEG_COLORS = {0: "#808080", 19: "#7a0fe3", 18: "#c88c28", 17: "#a06000", 16: "#1a991a",
               15: "#000000", 14: "#0000ff", 13: "#ff0000", 12: "#ff00ff",
-              11: "#ff99c7", 10: "#ffff00"}
+              11: "#ff99c7", 10: "#ffff00",   # Hidden
+              64: "#00ffff", 65: "#a80000",   # Inside Corner / Outside Corner
+              66: "#00ff00", 67: "#ff00ff",   # Obtuse Inside Corner / Obtuse Outside Corner
+              68: "#0000cc", 69: "#006666",   # Top Wall / Bottom Wall (wall edges)
+              70: "#00aaee", 71: "#c55500", 72: "#aa00ee",   # Material Horizontal / Vertical / Oblique Boundary
+              73: "#0000cc", 74: "#009944",   # Material Top / Material Bottom
+              75: "#00ffff", 76: "#a80000",   # Material Inside Corner / Outside Corner
+              77: "#00ff00", 78: "#e200aa",   # Material Obtuse Inside Corner / Obtuse Outside Corner
+              100: "#666600"}   # Isoline
 
-# Dashed vs solid, per edge type
+# Dashed vs solid per edge type; unspecified gray segments use dotted lines.
 DASHED = {"StepFlashing", "Rake", "Valley", "Hip"}
 
 def line_style(code):
+    if code == UNSPECIFIED_CODE:
+        return ":"
     return "--" if SEG_NAMES[code] in DASHED else "-"
-UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn solid gray (kept distinct from "Other", code 11)
+UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn dotted gray (kept distinct from "Other", code 11)
 
-# Pitch labels on the plain wireframe: 9 pt is the normal size. A label is only
-# made smaller when it does not fit inside its facet at that size.
-PITCH_FONT_MAX = 9.0        # default size
-PITCH_FONT_MIN = 3.5        # never shrink below this
-PITCH_FONT_STEP = 0.5
-PITCH_BBOX_PAD = 0.15       # boxstyle pad, as a fraction of the font size
-PITCH_FIT_MARGIN_PT = 1.0   # extra breathing room around the label (points)
+# Material shading of facets in the 3D view (Facets[].MaterialID -> colour, drawn at MATERIAL_ALPHAS opacity).
+MATERIAL_NAMES = {1: "None", 2: "Siding", 3: "Masonry"}
+MATERIAL_COLORS = {1: "#bfb28c", 2: "#bfbf95", 3: "#70aca2"}
+# Opacity per material (opacity = 1 - transparency): all three are 75% transparent.
+MATERIAL_ALPHAS = {1: 0.25, 2: 0.25, 3: 0.25}
+# Facets with the Roof flag (512) get this tint on top of the material shading.
+ROOF_COLOR = "#a8f5a8"
+ROOF_ALPHA = 0.25  # 75% transparent
+# Hole facets (flag 32): gray lines, plus a gray tint (75% transparent) over the shading.
+HOLE_COLOR = "#808080"
+HOLE_ALPHA = 0.25
+# Floor facets (flag 2048) get no shading and no pitch label.
+FLOOR_FLAG = 2048
+# Facets with the Surface flag (8192) get this tint on top of the material shading.
+SURFACE_COLOR = "#f224e8"
+SURFACE_ALPHA = 0.25  # 75% transparent
+
+# Pitch labels shrink to fit their facet, starting at a compact size.
+PITCH_FONT_MAX = 5.0
+PITCH_FONT_MIN = 1.5
+PITCH_FONT_STEP = 0.25
+PITCH_FIT_MARGIN_PT = 0.25  # small clearance around the text (points)
 PITCH_MAX_CANDIDATES = 30   # centre positions tried per facet
 
-# Overlay look (drawn over the photo). Thin lines so the photo stays readable.
-OVERLAY_LINE_WIDTH = 0.8
-OVERLAY_HALO_WIDTH = 2.0
-OVERLAY_POINT_SIZE = 4
-OVERLAY_POINT_EDGE = 0.3
+# Overlay look (drawn over the photo).
+OVERLAY_LINE_WIDTH = 1.6
 
 
-def load_geometry(path):
+def segment_code(s):
+    """Edge-type code of a segment (a key of SEG_NAMES; UNSPECIFIED_CODE if unknown)."""
+    code = s.LegacyUserTypeOverride
+    code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
+    if code not in SEG_NAMES or code == UNSPECIFIED_CODE:
+        # no usable override: corner/wall edges are still recognisable from the segment's own Type
+        t = getattr(s, "Type", None)
+        if np.isscalar(t) and np.isfinite(t) and int(t) in (64, 65, 66, 67, 68, 69):
+            return int(t)
+        return UNSPECIFIED_CODE
+    return code
+
+
+def load_geometry(path, omit_infinite=True):
     """Return (points Nx3 array, list of (segment_type, [i, j]) with 0-based indices)."""
     # .evm files are renamed .mat files; open as a file object so the extension doesn't matter
     log.info("Loading %s", path)
@@ -4567,18 +4860,41 @@ def load_geometry(path):
         if len(idx) != 2:
             segs.append((UNSPECIFIED_CODE, None))  # placeholder keeps facet segment indices aligned
             continue
-        code = s.LegacyUserTypeOverride
-        code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
-        segs.append((code if code in SEG_NAMES else UNSPECIFIED_CODE, idx))
+        segs.append((segment_code(s), idx))
     facets = []
+    facet_types = []  # Facets[].Type bit flags (Roof=512, Wall=1024, Material=16384, ...), parallel to facets
+    facet_materials = []  # Facets[].MaterialID (1 None, 2 Siding, 3 Masonry), parallel to facets
     for f in np.atleast_1d(ts.Facets):
         seg_ids = np.atleast_1d(f.Contains).astype(int) - 1  # segment indices (1-based in file)
         pitch = f.Pitch if np.isscalar(f.Pitch) else np.nan
         facets.append((seg_ids, float(pitch)))
+        ft = np.asarray(getattr(f, "Type", 0)).ravel()
+        facet_types.append(int(ft[0]) if ft.size and np.isfinite(ft[0]) else 0)
+        fm = np.asarray(getattr(f, "MaterialID", 0)).ravel()
+        facet_materials.append(int(fm[0]) if fm.size and np.isfinite(fm[0]) else 0)
+    if omit_infinite:  # the 3D view keeps infinite-pitch facets
+        segs = omit_infinite_pitch_facet_segments(segs, facets)
     n_seg = sum(1 for _, ix in segs if ix is not None)
     log.info("Loaded %d points, %d segments, %d facets in %.2fs",
              len(pts), n_seg, len(facets), time.perf_counter() - t0)
-    return pts, segs, facets
+    return pts, segs, facets, facet_types, facet_materials
+
+
+def omit_infinite_pitch_facet_segments(segs, facets):
+    """Hide edges used only by facets whose pitch is infinite, preserving shared edges."""
+    infinite_ids = set()
+    other_ids = set()
+    for seg_ids, pitch in facets:
+        target = infinite_ids if np.isinf(pitch) else other_ids
+        target.update(int(k) for k in seg_ids if 0 <= int(k) < len(segs))
+    omitted_ids = infinite_ids - other_ids
+    if omitted_ids:
+        segs = [
+            (stype, None if i in omitted_ids else ix)
+            for i, (stype, ix) in enumerate(segs)
+        ]
+        log.info("Omitted %d segments belonging only to infinite-pitch facets", len(omitted_ids))
+    return segs
 
 
 def facet_polygon(seg_ids, segs_xy):
@@ -4647,7 +4963,7 @@ def box_fits(path, poly, cx, cy, hw, hh, samples=10):
     return not poking.any()
 
 
-def fit_pitch_label(poly, text, size_units):
+def fit_pitch_label(poly, text, size_units, max_fontsize=PITCH_FONT_MAX):
     """Pick (x, y, fontsize, fitted) for a pitch label.
 
     Tries the default font size first and only steps down when the label can't be
@@ -4656,7 +4972,7 @@ def fit_pitch_label(poly, text, size_units):
     """
     path = Path(poly)
     cands = label_candidates(poly)
-    sizes = np.arange(PITCH_FONT_MAX, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
+    sizes = np.arange(max_fontsize, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
     for fs in sizes:
         w, h = size_units(text, float(fs))
         for cx, cy in cands:
@@ -4671,8 +4987,8 @@ def fmt_pitch(p):
     return f"{p:g}"
 
 
-def draw_pitch_labels(fig, ax, pts, segs, facets):
-    """Draw each facet's pitch at the default size, shrinking only when it won't fit."""
+def draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=PITCH_FONT_MAX, facet_types=None):
+    """Draw each facet's pitch, shrinking only when it won't fit."""
     renderer = fig.canvas.get_renderer()
     p0 = ax.transData.transform((0.0, 0.0))
     p1 = ax.transData.transform((1.0, 0.0))
@@ -4686,18 +5002,29 @@ def draw_pitch_labels(fig, ax, pts, segs, facets):
     def size_units(text, fs):
         key = (text, fs)
         if key not in cache:
-            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold")
+            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold", fontfamily="Arial")
             bb = t.get_window_extent(renderer)
             t.remove()
-            pad = 2 * PITCH_BBOX_PAD * fs + PITCH_FIT_MARGIN_PT
-            cache[key] = ((bb.width * 72.0 / fig.dpi + pad) / pt_per_unit,
-                          (bb.height * 72.0 / fig.dpi + pad) / pt_per_unit)
+            margin = PITCH_FIT_MARGIN_PT
+            cache[key] = ((bb.width * 72.0 / fig.dpi + margin) / pt_per_unit,
+                          (bb.height * 72.0 / fig.dpi + margin) / pt_per_unit)
         return cache[key]
 
     segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
     drawn = shrunk = tight = skipped = 0
     for n, (seg_ids, pv) in enumerate(facets, start=1):
+        if facet_types is not None and (facet_types[n - 1] & FLOOR_FLAG):  # Floor facets get no pitch label
+            skipped += 1
+            continue
         if not np.isfinite(pv):  # nan or +/-inf pitch: nothing sensible to show
+            skipped += 1
+            continue
+        facet_line_ids = [
+            int(k) for k in seg_ids
+            if 0 <= int(k) < len(segs) and segs[int(k)][1] is not None
+        ]
+        if pv == 0 and facet_line_ids and all(segs[k][0] == UNSPECIFIED_CODE for k in facet_line_ids):
+            log.debug("Facet %d: zero pitch hidden because all outline lines are gray", n)
             skipped += 1
             continue
         loop = facet_polygon(seg_ids, segs_xy)
@@ -4708,27 +5035,36 @@ def draw_pitch_labels(fig, ax, pts, segs, facets):
         poly = pts[loop][:, :2]
         text = fmt_pitch(pv)
         if can_fit:
-            x, y, fs, fitted = fit_pitch_label(poly, text, size_units)
+            x, y, fs, fitted = fit_pitch_label(poly, text, size_units, max_fontsize)
         else:
             x, y = label_point(poly)
-            fs, fitted = PITCH_FONT_MAX, True
-        if fs < PITCH_FONT_MAX:
+            fs, fitted = max_fontsize, True
+        if fs < max_fontsize:
             shrunk += 1
-            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, PITCH_FONT_MAX, fs)
+            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, max_fontsize, fs)
         if not fitted:
             tight += 1
             log.warning("Facet %d: pitch %s still does not fit at %.1f pt (facet is very small)", n, text, fs)
         ax.text(x, y, text, ha="center", va="center", fontsize=fs,
-                fontweight="bold", color="#0a4d8c", zorder=4,
-                bbox=dict(boxstyle=f"round,pad={PITCH_BBOX_PAD}", fc="white", ec="none", alpha=0.8))
+                fontweight="bold", fontfamily="Arial", color="#0a4d8c", zorder=4)
         drawn += 1
     log.info("Pitch labels: %d drawn, %d shrunk, %d too small even at minimum, %d skipped",
              drawn, shrunk, tight, skipped)
 
 
-def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
+def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=300, match_image=None, facet_types=None):
     ok = ~np.isnan(pts).any(axis=1)
-    fig, ax = plt.subplots(figsize=(9, 9), facecolor="white")
+    if match_image:
+        import matplotlib.image as mpimg
+
+        h, w = mpimg.imread(match_image).shape[:2]
+        k = min(3.0, 4200 / max(w, h))
+        pitch_max_fontsize = PITCH_FONT_MAX * max(1.0, min(3.0, max(w * k, h * k) / 1400))
+        figsize = (w * k / dpi, h * k / dpi)
+    else:
+        pitch_max_fontsize = PITCH_FONT_MAX
+        figsize = (9, 9)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi, facecolor="white")
     used = {}
 
     for stype, ix in segs:
@@ -4739,11 +5075,10 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
             continue
         used[stype] = used.get(stype, 0) + 1
         ax.plot([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]],
-                line_style(stype), color=SEG_COLORS[stype], lw=1.2)
+                line_style(stype), color=SEG_COLORS[stype], lw=0.5,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0)
     log.info("Drew %d segments (%s)", sum(used.values()),
              ", ".join(f"{SEG_NAMES[c]}={n}" for c, n in sorted(used.items())) or "none")
-
-    ax.scatter(pts[ok, 0], pts[ok, 1], s=10, c="black", zorder=3)
 
     ax.set_aspect("equal")
     ax.invert_yaxis()  # image-style coordinates: y grows downward
@@ -4752,7 +5087,7 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
 
     if pitch:
         fig.canvas.draw()  # settle limits/aspect so the data -> point scale is known
-        draw_pitch_labels(fig, ax, pts, segs, facets)
+        draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=pitch_max_fontsize, facet_types=facet_types)
     else:
         log.info("Pitch labels hidden (--no-pitch)")
 
@@ -4760,14 +5095,83 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
     plt.close(fig)
 
 
-def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
+def export_3d(pts, segs, facets, out_path, facet_types=None, facet_materials=None):
+    """Write the 3D geometry as JSON: {"P": [[x, y, z]...], "S": [[i, j, code]...], ...}.
+
+    Only points used by a drawn segment are kept (segments are re-indexed). Z is
+    reversed so the model is upright. Segment codes/colours are the same as the
+    top-down wireframe, so the 3D view matches it. Infinite-pitch facets keep their edges.
+    "F" holds one pitch label per facet: {"p": text, "l": [x, y, z]} with the label
+    placed inside the facet, on its plane (facets with no finite pitch - nan or
+    infinite - get no label).
+    """
+    ok = ~np.isnan(pts).any(axis=1)
+    ftypes = list(facet_types) if facet_types is not None else [0] * len(facets)
+    fmats = list(facet_materials) if facet_materials is not None else [0] * len(facets)
+    seg_ftypes = {}  # segment index -> set of the facet types that use it (the viewer's type toggles)
+    for (seg_ids, _), ft in zip(facets, ftypes):
+        for k in seg_ids:
+            seg_ftypes.setdefault(int(k), set()).add(int(ft))
+    kept = [(n, stype, ix) for n, (stype, ix) in enumerate(segs)
+            if ix is not None and ok[ix[0]] and ok[ix[1]]]
+    used = sorted({int(k) for _, _, ix in kept for k in ix})
+    remap = {old: new for new, old in enumerate(used)}
+    P = pts[used].copy()
+    P[:, 2] *= -1  # reverse Z
+
+    segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
+    F = []
+    for fi, (seg_ids, pv) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or np.isnan(pts[loop]).any() or not np.isfinite(pv) or (ftypes[fi] & FLOOR_FLAG):
+            continue  # no usable outline, or nan/inf pitch: nothing to label
+        poly3 = pts[loop]
+        x, y = label_point(poly3[:, :2])
+        try:  # z on the facet's own plane (least squares); fall back to the mean height
+            a = np.c_[poly3[:, 0], poly3[:, 1], np.ones(len(poly3))]
+            cf = np.linalg.lstsq(a, poly3[:, 2], rcond=None)[0]
+            z = float(cf[0] * x + cf[1] * y + cf[2])
+        except Exception:
+            z = float(poly3[:, 2].mean())
+        F.append({"p": fmt_pitch(pv), "t": ftypes[fi],
+                  "l": [round(float(x), 2), round(float(y), 2), round(-z + 0.0, 2)]})
+    A = []  # shaded facet outlines: [materialID, facetType, [point indices]]
+    for fi, (seg_ids, _) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or any(int(k) not in remap for k in loop):
+            continue
+        A.append([fmats[fi], ftypes[fi], [remap[int(k)] for k in loop]])
+    data = {
+        "A": A,
+        "mat": {str(k): v for k, v in MATERIAL_COLORS.items()},
+        "matNames": {str(k): v for k, v in MATERIAL_NAMES.items()},
+        "matAlphas": {str(k): v for k, v in MATERIAL_ALPHAS.items()},
+        "hole": HOLE_COLOR,
+        "holeAlpha": HOLE_ALPHA,
+        "roof": ROOF_COLOR,
+        "roofAlpha": ROOF_ALPHA,
+        "surf": SURFACE_COLOR,
+        "surfAlpha": SURFACE_ALPHA,
+        "P": (np.round(P, 2) + 0.0).tolist(),  # + 0.0 turns -0.0 into 0.0
+        "S": [[remap[int(ix[0])], remap[int(ix[1])], int(stype), sorted(seg_ftypes.get(n, []))]
+              for n, stype, ix in kept],
+        "F": F,
+        "colors": {str(k): v for k, v in SEG_COLORS.items()},
+        "names": {str(k): v for k, v in SEG_NAMES.items()},
+    }
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    log.info("Wrote 3D geometry: %d points, %d segments, %d facet labels -> %s",
+             len(P), len(data["S"]), len(F), out_path)
+
+
+def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=4200):
     """Draw the wireframe on top of the top-down photo (model x/y == photo pixels)."""
     import matplotlib.image as mpimg
-    import matplotlib.patheffects as pe
 
     img = mpimg.imread(img_path)
     h, w = img.shape[:2]
-    k = min(1.0, max_px / max(w, h))
+    k = min(3.0, max_px / max(w, h))
     log.info("Overlay on %s (%dx%d px, output scale %.2f, model scale %.2f)", img_path, w, h, k, scale)
     dpi = 100
     fig = plt.figure(figsize=(w * k / dpi, h * k / dpi), dpi=dpi, facecolor="black")
@@ -4785,7 +5189,6 @@ def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
             log.warning("Wireframe extent x %.0f..%.0f, y %.0f..%.0f does not fit the %dx%d photo - try --scale",
                         lo[0], hi[0], lo[1], hi[1], w, h)
 
-    halo = [pe.Stroke(linewidth=OVERLAY_HALO_WIDTH, foreground="white", alpha=0.85), pe.Normal()]
     drawn = 0
     for stype, ix in segs:
         if ix is None:
@@ -4794,10 +5197,10 @@ def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
         if not (ok[i] and ok[j]):
             continue
         ax.plot([xy[i, 0], xy[j, 0]], [xy[i, 1], xy[j, 1]], line_style(stype),
-                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH, path_effects=halo)
+                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0,
+                zorder=3)
         drawn += 1
-    ax.scatter(xy[ok, 0], xy[ok, 1], s=OVERLAY_POINT_SIZE, c="black", edgecolors="white",
-               linewidths=OVERLAY_POINT_EDGE, zorder=3)
     log.info("Drew %d segments on the photo (line width %.1f)", drawn, OVERLAY_LINE_WIDTH)
     ax.set_xlim(0, w)
     ax.set_ylim(h, 0)
@@ -4813,13 +5216,17 @@ def main():
     ap.add_argument("-o", "--output", default=None,
                     help="Output PNG (default: <evm_file>_topdown.png)")
     ap.add_argument("--no-pitch", action="store_true", help="Hide per-facet pitch labels")
-    ap.add_argument("--dpi", type=int, default=150)
+    ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging")
     ap.add_argument("-q", "--quiet", action="store_true", help="Only log warnings and errors")
     ap.add_argument("--overlay", default=None, metavar="IMAGE",
                     help="Draw the wireframe on top of this top-down photo instead")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="Multiply model x/y by this to match the photo's resolution (overlay only)")
+    ap.add_argument("--match-image", default=None, metavar="IMAGE",
+                    help="Match the plain wireframe canvas dimensions to this image")
+    ap.add_argument("--json3d", action="store_true",
+                    help="Write the 3D geometry as JSON (for the interactive 3D view) instead of a PNG")
     args = ap.parse_args()
 
     # Log to stdout (flushed per line) so the lines stay in order with the final
@@ -4829,17 +5236,20 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
                         handlers=[handler])
 
-    out = args.output or args.evm_file.rsplit(".", 1)[0] + "_topdown.png"
-    mode = "overlay" if args.overlay else "wireframe"
+    out = args.output or args.evm_file.rsplit(".", 1)[0] + ("_3d.json" if args.json3d else "_topdown.png")
+    mode = "3d" if args.json3d else "overlay" if args.overlay else "wireframe"
     log.info("Rendering %s for %s -> %s", mode, args.evm_file, out)
     t0 = time.perf_counter()
     try:
-        pts, segs, facets = load_geometry(args.evm_file)
-        if args.overlay:
+        pts, segs, facets, facet_types, facet_materials = load_geometry(args.evm_file, omit_infinite=not args.json3d)
+        if args.json3d:
+            export_3d(pts, segs, facets, out, facet_types, facet_materials)
+        elif args.overlay:
             plot_overlay(pts, segs, args.overlay, out, scale=args.scale)
         else:
             plot_top_down(pts, segs, facets, out,
-                          pitch=not args.no_pitch, dpi=args.dpi)
+                          pitch=not args.no_pitch, dpi=args.dpi,
+                          match_image=args.match_image, facet_types=facet_types)
     except Exception:
         log.exception("Failed to render %s", mode)
         sys.exit(1)
@@ -4864,7 +5274,7 @@ if (-not $WireframeScriptLocal) {
     catch { }
 }
 if ($WireframeScriptLocal) { Write-ParLog "wireframe script: $WireframeScriptLocal" 'INFO' 'startup' }
-else { Write-ParLog 'roof_wireframe.py not available - Wireframe/Overlay tiles will show an error' 'WARN' 'startup' }
+else { Write-ParLog 'roof_wireframe.py not available - Overlay (2D)/Wireframes (3D) tiles will show an error' 'WARN' 'startup' }
 # fileinfo.exe writes its own intermediate file to a FIXED path in the
 # user's Temp folder while it parses (not something we control — it's
 # internal to the tool). With the request pool running several requests at
@@ -4925,7 +5335,7 @@ $requestScript = {
         switch ($p) {
             '/api/images'     { return "images: report=$($q['reportId']) location=$($q['location'])$(if ($q['folderName']) { ' folder=' + $q['folderName'] })" }
             '/api/file-info'  { return "file-info: report=$($q['reportId']) state=$($q['state']) source=$($q['source'])" }
-            '/api/wireframe'  { $mode = if ($q['overlay'] -eq '1') { 'overlay' } else { 'wireframe' }; return "wireframe ($mode): $((("$($q['evm'])") -split '[\\/]')[-1])" }
+            '/api/wireframe'  { $mode = if ($q['view3d'] -eq '1') { '3d' } elseif ($q['overlay'] -eq '1') { 'overlay' } else { 'wireframe' }; return "wireframe ($mode): $((("$($q['evm'])") -split '[\\/]')[-1])" }
             '/api/image-file' { return "image-file: $((("$($q['path'])") -split '[\\/]')[-1])" }
             default           { return "$($ctx.Request.HttpMethod) $p" }
         }
@@ -5165,10 +5575,14 @@ $requestScript = {
         #   (default)     plain top-down wireframe
         #   overlay=1     wireframe drawn on the report's top-down photo
         #                 (Images\O_****_**.jpg next to the Rollback folder)
+        #   view3d=1      3D geometry as JSON (not a PNG) for the rotatable Wireframes (3D) tile
+        #                 (includes infinite-pitch facet edges; a pitch label per finite-pitch facet)
         # Only .evm files under the known archive roots are accepted (same
         # allow-list as Handle-ImageFile). Results are cached per file version.
         $reqPath = $ctx.Request.QueryString['evm']
         $overlay = ($ctx.Request.QueryString['overlay'] -eq '1')
+        $view3d  = ($ctx.Request.QueryString['view3d'] -eq '1')
+        if ($view3d) { $overlay = $false }
         if ([string]::IsNullOrWhiteSpace($reqPath)) {
             Write-JsonResponse $ctx @{ found = $false; error = 'Missing evm path' } 400
             return
@@ -5195,24 +5609,23 @@ $requestScript = {
             Write-JsonResponse $ctx @{ found = $false; error = 'Python 3 not found (needs numpy, scipy, matplotlib)' } 500
             return
         }
+        # <archive folder>\Rollback\<n>.0.evm  ->  <archive folder>\Images\O_****_**.jpg
+        $folderDir = Split-Path -Path (Split-Path -Path $full -Parent) -Parent
+        $imagesDir = Join-Path $folderDir 'Images'
         $topDownFile = $null
-        if ($overlay) {
-            # <archive folder>\Rollback\<n>.0.evm  ->  <archive folder>\Images\O_****_**.jpg
-            $folderDir = Split-Path -Path (Split-Path -Path $full -Parent) -Parent
-            $imagesDir = Join-Path $folderDir 'Images'
-            if (Test-Path -LiteralPath $imagesDir) {
-                $topDownFile = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match '^O_[^_]+_[^_]+\.jpe?g$' } |
-                    Sort-Object LastWriteTime -Descending |
-                    Select-Object -First 1
-            }
-            if (-not $topDownFile) {
-                Write-JsonResponse $ctx @{ found = $false; code = 'no-topdown'; error = 'No top-down image (O_****_**.jpg) found' } 404
-                return
-            }
+        if (-not $view3d -and (Test-Path -LiteralPath $imagesDir)) {
+            $topDownFile = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^O_[^_]+_[^_]+\.jpe?g$' } |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+        }
+        if ($overlay -and -not $topDownFile) {
+            Write-JsonResponse $ctx @{ found = $false; code = 'no-topdown'; error = 'No top-down image (O_****_**.jpg) found' } 404
+            return
         }
         $ticks = (Get-Item -LiteralPath $full).LastWriteTimeUtc.Ticks
-        $wfKey = if ($overlay) { "wfo:$full|$ticks|$($topDownFile.FullName)|$($topDownFile.LastWriteTimeUtc.Ticks)" } else { "wf:$full|$ticks" }
+        $imageKey = if ($topDownFile) { "|$($topDownFile.FullName)|$($topDownFile.LastWriteTimeUtc.Ticks)" } else { '' }
+        $wfKey = if ($view3d) { "wf3d-v6:$full|$ticks" } elseif ($overlay) { "wfo-v5:$full|$ticks$imageKey" } else { "wf-v5:$full|$ticks$imageKey" }
         $png = $null
         $cachedPng = $null
         if ($FolderCache.TryGetValue($wfKey, [ref]$cachedPng) -and $cachedPng -is [byte[]]) {
@@ -5223,16 +5636,20 @@ $requestScript = {
             $id       = [guid]::NewGuid().ToString('N')
             $localEvm = Join-Path $env:TEMP "parwf_$id.evm"
             $localImg = Join-Path $env:TEMP "parwf_$id.jpg"
-            $outPng   = Join-Path $env:TEMP "parwf_$id.png"
+            $outPng   = Join-Path $env:TEMP ("parwf_$id" + $(if ($view3d) { '.json' } else { '.png' }))   # JSON for the 3D view
             try {
                 Copy-Item -LiteralPath $full -Destination $localEvm -Force
-                $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--dpi', '110')
-                if ($overlay) {
+                $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--dpi', '300')
+                if ($view3d) { $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--json3d') }
+                elseif ($topDownFile) {
                     Copy-Item -LiteralPath $topDownFile.FullName -Destination $localImg -Force
+                    $pyArgs += @('--match-image', $localImg)
+                }
+                if ($overlay -and -not $view3d) {
                     $pyArgs += @('--overlay', $localImg)
                 }
                 $wfSw = [System.Diagnostics.Stopwatch]::StartNew()
-                Write-ParLog ("running {0} ({1})" -f [System.IO.Path]::GetFileName($WireframeScriptLocal), $(if ($overlay) { 'overlay on ' + $topDownFile.Name } else { 'plain wireframe' })) 'DEBUG' 'wireframe'
+                Write-ParLog ("running {0} ({1})" -f [System.IO.Path]::GetFileName($WireframeScriptLocal), $(if ($view3d) { '3D geometry' } elseif ($overlay) { 'overlay on ' + $topDownFile.Name } else { 'plain wireframe' })) 'DEBUG' 'wireframe'
                 $log = & $PythonExeLocal @pyArgs 2>&1 | Out-String
                 foreach ($pyLine in ($log -split "\r?\n")) {
                     if (-not $pyLine.Trim()) { continue }
@@ -5271,7 +5688,7 @@ $requestScript = {
             }
             $FolderCache[$wfKey] = $png
         }
-        $ctx.Response.ContentType     = 'image/png'
+        $ctx.Response.ContentType     = if ($view3d) { 'application/json; charset=utf-8' } else { 'image/png' }
         $ctx.Response.ContentLength64 = $png.Length
         $ctx.Response.OutputStream.Write($png, 0, $png.Length)
     }

@@ -7,8 +7,13 @@ Usage:
     python roof_wireframe.py job.evm -o overlay.png --overlay O_1234_01.jpg
     python roof_wireframe.py job.evm -v        # extra (debug) logging
     python roof_wireframe.py job.evm -q        # warnings/errors only
+    python roof_wireframe.py job.evm --json3d -o job_3d.json   # 3D geometry for the PAR "3D View" tile
 
 Progress is logged to the terminal (stdout) with timestamps.
+
+--json3d writes the 3D geometry (points + typed segments + a pitch label per facet,
+Z reversed so the roof sits upright) as JSON instead of a PNG. Unlike the top-down
+image it keeps the edges of facets with an infinite pitch (but gives them no label); PAR renders it as a rotatable 3D view.
 
 --overlay draws the wireframe on top of the given top-down photo. The model
 units are image pixels (Units == 'pixels', ImageData[0] has a ~identity
@@ -19,6 +24,7 @@ photo was exported at a different resolution than the tool's working image, use
 Requires: numpy, scipy, matplotlib
 """
 import argparse
+import json
 import logging
 import sys
 import time
@@ -37,35 +43,76 @@ log = logging.getLogger("roof_wireframe")
 # (same codes as SegmentLabels.Style). Mapping inferred from the file's geometry.
 SEG_NAMES = {0: "Unspecified", 19: "Parapet", 18: "Flashing", 17: "StepFlashing", 16: "Rake",
              15: "Eave", 14: "Valley", 13: "Ridge", 12: "Hip", 11: "Other",
-             10: "Hidden"}
+             10: "Hidden", 64: "Inside Corner", 65: "Outside Corner",
+             66: "Obtuse Inside Corner", 67: "Obtuse Outside Corner", 68: "Top Wall", 69: "Bottom Wall",
+             70: "Material Horizontal Boundary", 71: "Material Vertical Boundary",
+             72: "Material Oblique Boundary", 73: "Material Top", 74: "Material Bottom",
+             75: "Material Inside Corner", 76: "Material Outside Corner",
+             77: "Material Obtuse Inside Corner", 78: "Material Obtuse Outside Corner",
+             100: "Isoline"}
 SEG_COLORS = {0: "#808080", 19: "#7a0fe3", 18: "#c88c28", 17: "#a06000", 16: "#1a991a",
               15: "#000000", 14: "#0000ff", 13: "#ff0000", 12: "#ff00ff",
-              11: "#ff99c7", 10: "#ffff00"}
+              11: "#ff99c7", 10: "#ffff00",   # Hidden
+              64: "#00ffff", 65: "#a80000",   # Inside Corner / Outside Corner
+              66: "#00ff00", 67: "#ff00ff",   # Obtuse Inside Corner / Obtuse Outside Corner
+              68: "#0000cc", 69: "#006666",   # Top Wall / Bottom Wall (wall edges)
+              70: "#00aaee", 71: "#c55500", 72: "#aa00ee",   # Material Horizontal / Vertical / Oblique Boundary
+              73: "#0000cc", 74: "#009944",   # Material Top / Material Bottom
+              75: "#00ffff", 76: "#a80000",   # Material Inside Corner / Outside Corner
+              77: "#00ff00", 78: "#e200aa",   # Material Obtuse Inside Corner / Obtuse Outside Corner
+              100: "#666600"}   # Isoline
 
-# Dashed vs solid, per edge type
+# Dashed vs solid per edge type; unspecified gray segments use dotted lines.
 DASHED = {"StepFlashing", "Rake", "Valley", "Hip"}
 
 def line_style(code):
+    if code == UNSPECIFIED_CODE:
+        return ":"
     return "--" if SEG_NAMES[code] in DASHED else "-"
-UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn solid gray (kept distinct from "Other", code 11)
+UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn dotted gray (kept distinct from "Other", code 11)
 
-# Pitch labels on the plain wireframe: 9 pt is the normal size. A label is only
-# made smaller when it does not fit inside its facet at that size.
-PITCH_FONT_MAX = 9.0        # default size
-PITCH_FONT_MIN = 3.5        # never shrink below this
-PITCH_FONT_STEP = 0.5
-PITCH_BBOX_PAD = 0.15       # boxstyle pad, as a fraction of the font size
-PITCH_FIT_MARGIN_PT = 1.0   # extra breathing room around the label (points)
+# Material shading of facets in the 3D view (Facets[].MaterialID -> colour, drawn at MATERIAL_ALPHAS opacity).
+MATERIAL_NAMES = {1: "None", 2: "Siding", 3: "Masonry"}
+MATERIAL_COLORS = {1: "#bfb28c", 2: "#bfbf95", 3: "#70aca2"}
+# Opacity per material (opacity = 1 - transparency): all three are 75% transparent.
+MATERIAL_ALPHAS = {1: 0.25, 2: 0.25, 3: 0.25}
+# Facets with the Roof flag (512) get this tint on top of the material shading.
+ROOF_COLOR = "#a8f5a8"
+ROOF_ALPHA = 0.25  # 75% transparent
+# Hole facets (flag 32): gray lines, plus a gray tint (75% transparent) over the shading.
+HOLE_COLOR = "#808080"
+HOLE_ALPHA = 0.25
+# Floor facets (flag 2048) get no shading and no pitch label.
+FLOOR_FLAG = 2048
+# Facets with the Surface flag (8192) get this tint on top of the material shading.
+SURFACE_COLOR = "#f224e8"
+SURFACE_ALPHA = 0.25  # 75% transparent
+
+# Pitch labels shrink to fit their facet, starting at a compact size.
+PITCH_FONT_MAX = 5.0
+PITCH_FONT_MIN = 1.5
+PITCH_FONT_STEP = 0.25
+PITCH_FIT_MARGIN_PT = 0.25  # small clearance around the text (points)
 PITCH_MAX_CANDIDATES = 30   # centre positions tried per facet
 
-# Overlay look (drawn over the photo). Thin lines so the photo stays readable.
-OVERLAY_LINE_WIDTH = 0.8
-OVERLAY_HALO_WIDTH = 2.0
-OVERLAY_POINT_SIZE = 4
-OVERLAY_POINT_EDGE = 0.3
+# Overlay look (drawn over the photo).
+OVERLAY_LINE_WIDTH = 1.6
 
 
-def load_geometry(path):
+def segment_code(s):
+    """Edge-type code of a segment (a key of SEG_NAMES; UNSPECIFIED_CODE if unknown)."""
+    code = s.LegacyUserTypeOverride
+    code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
+    if code not in SEG_NAMES or code == UNSPECIFIED_CODE:
+        # no usable override: corner/wall edges are still recognisable from the segment's own Type
+        t = getattr(s, "Type", None)
+        if np.isscalar(t) and np.isfinite(t) and int(t) in (64, 65, 66, 67, 68, 69):
+            return int(t)
+        return UNSPECIFIED_CODE
+    return code
+
+
+def load_geometry(path, omit_infinite=True):
     """Return (points Nx3 array, list of (segment_type, [i, j]) with 0-based indices)."""
     # .evm files are renamed .mat files; open as a file object so the extension doesn't matter
     log.info("Loading %s", path)
@@ -82,18 +129,41 @@ def load_geometry(path):
         if len(idx) != 2:
             segs.append((UNSPECIFIED_CODE, None))  # placeholder keeps facet segment indices aligned
             continue
-        code = s.LegacyUserTypeOverride
-        code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
-        segs.append((code if code in SEG_NAMES else UNSPECIFIED_CODE, idx))
+        segs.append((segment_code(s), idx))
     facets = []
+    facet_types = []  # Facets[].Type bit flags (Roof=512, Wall=1024, Material=16384, ...), parallel to facets
+    facet_materials = []  # Facets[].MaterialID (1 None, 2 Siding, 3 Masonry), parallel to facets
     for f in np.atleast_1d(ts.Facets):
         seg_ids = np.atleast_1d(f.Contains).astype(int) - 1  # segment indices (1-based in file)
         pitch = f.Pitch if np.isscalar(f.Pitch) else np.nan
         facets.append((seg_ids, float(pitch)))
+        ft = np.asarray(getattr(f, "Type", 0)).ravel()
+        facet_types.append(int(ft[0]) if ft.size and np.isfinite(ft[0]) else 0)
+        fm = np.asarray(getattr(f, "MaterialID", 0)).ravel()
+        facet_materials.append(int(fm[0]) if fm.size and np.isfinite(fm[0]) else 0)
+    if omit_infinite:  # the 3D view keeps infinite-pitch facets
+        segs = omit_infinite_pitch_facet_segments(segs, facets)
     n_seg = sum(1 for _, ix in segs if ix is not None)
     log.info("Loaded %d points, %d segments, %d facets in %.2fs",
              len(pts), n_seg, len(facets), time.perf_counter() - t0)
-    return pts, segs, facets
+    return pts, segs, facets, facet_types, facet_materials
+
+
+def omit_infinite_pitch_facet_segments(segs, facets):
+    """Hide edges used only by facets whose pitch is infinite, preserving shared edges."""
+    infinite_ids = set()
+    other_ids = set()
+    for seg_ids, pitch in facets:
+        target = infinite_ids if np.isinf(pitch) else other_ids
+        target.update(int(k) for k in seg_ids if 0 <= int(k) < len(segs))
+    omitted_ids = infinite_ids - other_ids
+    if omitted_ids:
+        segs = [
+            (stype, None if i in omitted_ids else ix)
+            for i, (stype, ix) in enumerate(segs)
+        ]
+        log.info("Omitted %d segments belonging only to infinite-pitch facets", len(omitted_ids))
+    return segs
 
 
 def facet_polygon(seg_ids, segs_xy):
@@ -162,7 +232,7 @@ def box_fits(path, poly, cx, cy, hw, hh, samples=10):
     return not poking.any()
 
 
-def fit_pitch_label(poly, text, size_units):
+def fit_pitch_label(poly, text, size_units, max_fontsize=PITCH_FONT_MAX):
     """Pick (x, y, fontsize, fitted) for a pitch label.
 
     Tries the default font size first and only steps down when the label can't be
@@ -171,7 +241,7 @@ def fit_pitch_label(poly, text, size_units):
     """
     path = Path(poly)
     cands = label_candidates(poly)
-    sizes = np.arange(PITCH_FONT_MAX, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
+    sizes = np.arange(max_fontsize, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
     for fs in sizes:
         w, h = size_units(text, float(fs))
         for cx, cy in cands:
@@ -186,8 +256,8 @@ def fmt_pitch(p):
     return f"{p:g}"
 
 
-def draw_pitch_labels(fig, ax, pts, segs, facets):
-    """Draw each facet's pitch at the default size, shrinking only when it won't fit."""
+def draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=PITCH_FONT_MAX, facet_types=None):
+    """Draw each facet's pitch, shrinking only when it won't fit."""
     renderer = fig.canvas.get_renderer()
     p0 = ax.transData.transform((0.0, 0.0))
     p1 = ax.transData.transform((1.0, 0.0))
@@ -201,18 +271,29 @@ def draw_pitch_labels(fig, ax, pts, segs, facets):
     def size_units(text, fs):
         key = (text, fs)
         if key not in cache:
-            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold")
+            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold", fontfamily="Arial")
             bb = t.get_window_extent(renderer)
             t.remove()
-            pad = 2 * PITCH_BBOX_PAD * fs + PITCH_FIT_MARGIN_PT
-            cache[key] = ((bb.width * 72.0 / fig.dpi + pad) / pt_per_unit,
-                          (bb.height * 72.0 / fig.dpi + pad) / pt_per_unit)
+            margin = PITCH_FIT_MARGIN_PT
+            cache[key] = ((bb.width * 72.0 / fig.dpi + margin) / pt_per_unit,
+                          (bb.height * 72.0 / fig.dpi + margin) / pt_per_unit)
         return cache[key]
 
     segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
     drawn = shrunk = tight = skipped = 0
     for n, (seg_ids, pv) in enumerate(facets, start=1):
+        if facet_types is not None and (facet_types[n - 1] & FLOOR_FLAG):  # Floor facets get no pitch label
+            skipped += 1
+            continue
         if not np.isfinite(pv):  # nan or +/-inf pitch: nothing sensible to show
+            skipped += 1
+            continue
+        facet_line_ids = [
+            int(k) for k in seg_ids
+            if 0 <= int(k) < len(segs) and segs[int(k)][1] is not None
+        ]
+        if pv == 0 and facet_line_ids and all(segs[k][0] == UNSPECIFIED_CODE for k in facet_line_ids):
+            log.debug("Facet %d: zero pitch hidden because all outline lines are gray", n)
             skipped += 1
             continue
         loop = facet_polygon(seg_ids, segs_xy)
@@ -223,27 +304,36 @@ def draw_pitch_labels(fig, ax, pts, segs, facets):
         poly = pts[loop][:, :2]
         text = fmt_pitch(pv)
         if can_fit:
-            x, y, fs, fitted = fit_pitch_label(poly, text, size_units)
+            x, y, fs, fitted = fit_pitch_label(poly, text, size_units, max_fontsize)
         else:
             x, y = label_point(poly)
-            fs, fitted = PITCH_FONT_MAX, True
-        if fs < PITCH_FONT_MAX:
+            fs, fitted = max_fontsize, True
+        if fs < max_fontsize:
             shrunk += 1
-            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, PITCH_FONT_MAX, fs)
+            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, max_fontsize, fs)
         if not fitted:
             tight += 1
             log.warning("Facet %d: pitch %s still does not fit at %.1f pt (facet is very small)", n, text, fs)
         ax.text(x, y, text, ha="center", va="center", fontsize=fs,
-                fontweight="bold", color="#0a4d8c", zorder=4,
-                bbox=dict(boxstyle=f"round,pad={PITCH_BBOX_PAD}", fc="white", ec="none", alpha=0.8))
+                fontweight="bold", fontfamily="Arial", color="#0a4d8c", zorder=4)
         drawn += 1
     log.info("Pitch labels: %d drawn, %d shrunk, %d too small even at minimum, %d skipped",
              drawn, shrunk, tight, skipped)
 
 
-def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
+def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=300, match_image=None, facet_types=None):
     ok = ~np.isnan(pts).any(axis=1)
-    fig, ax = plt.subplots(figsize=(9, 9), facecolor="white")
+    if match_image:
+        import matplotlib.image as mpimg
+
+        h, w = mpimg.imread(match_image).shape[:2]
+        k = min(3.0, 4200 / max(w, h))
+        pitch_max_fontsize = PITCH_FONT_MAX * max(1.0, min(3.0, max(w * k, h * k) / 1400))
+        figsize = (w * k / dpi, h * k / dpi)
+    else:
+        pitch_max_fontsize = PITCH_FONT_MAX
+        figsize = (9, 9)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi, facecolor="white")
     used = {}
 
     for stype, ix in segs:
@@ -254,11 +344,10 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
             continue
         used[stype] = used.get(stype, 0) + 1
         ax.plot([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]],
-                line_style(stype), color=SEG_COLORS[stype], lw=1.2)
+                line_style(stype), color=SEG_COLORS[stype], lw=0.5,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0)
     log.info("Drew %d segments (%s)", sum(used.values()),
              ", ".join(f"{SEG_NAMES[c]}={n}" for c, n in sorted(used.items())) or "none")
-
-    ax.scatter(pts[ok, 0], pts[ok, 1], s=10, c="black", zorder=3)
 
     ax.set_aspect("equal")
     ax.invert_yaxis()  # image-style coordinates: y grows downward
@@ -267,7 +356,7 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
 
     if pitch:
         fig.canvas.draw()  # settle limits/aspect so the data -> point scale is known
-        draw_pitch_labels(fig, ax, pts, segs, facets)
+        draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=pitch_max_fontsize, facet_types=facet_types)
     else:
         log.info("Pitch labels hidden (--no-pitch)")
 
@@ -275,14 +364,83 @@ def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
     plt.close(fig)
 
 
-def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
+def export_3d(pts, segs, facets, out_path, facet_types=None, facet_materials=None):
+    """Write the 3D geometry as JSON: {"P": [[x, y, z]...], "S": [[i, j, code]...], ...}.
+
+    Only points used by a drawn segment are kept (segments are re-indexed). Z is
+    reversed so the model is upright. Segment codes/colours are the same as the
+    top-down wireframe, so the 3D view matches it. Infinite-pitch facets keep their edges.
+    "F" holds one pitch label per facet: {"p": text, "l": [x, y, z]} with the label
+    placed inside the facet, on its plane (facets with no finite pitch - nan or
+    infinite - get no label).
+    """
+    ok = ~np.isnan(pts).any(axis=1)
+    ftypes = list(facet_types) if facet_types is not None else [0] * len(facets)
+    fmats = list(facet_materials) if facet_materials is not None else [0] * len(facets)
+    seg_ftypes = {}  # segment index -> set of the facet types that use it (the viewer's type toggles)
+    for (seg_ids, _), ft in zip(facets, ftypes):
+        for k in seg_ids:
+            seg_ftypes.setdefault(int(k), set()).add(int(ft))
+    kept = [(n, stype, ix) for n, (stype, ix) in enumerate(segs)
+            if ix is not None and ok[ix[0]] and ok[ix[1]]]
+    used = sorted({int(k) for _, _, ix in kept for k in ix})
+    remap = {old: new for new, old in enumerate(used)}
+    P = pts[used].copy()
+    P[:, 2] *= -1  # reverse Z
+
+    segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
+    F = []
+    for fi, (seg_ids, pv) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or np.isnan(pts[loop]).any() or not np.isfinite(pv) or (ftypes[fi] & FLOOR_FLAG):
+            continue  # no usable outline, or nan/inf pitch: nothing to label
+        poly3 = pts[loop]
+        x, y = label_point(poly3[:, :2])
+        try:  # z on the facet's own plane (least squares); fall back to the mean height
+            a = np.c_[poly3[:, 0], poly3[:, 1], np.ones(len(poly3))]
+            cf = np.linalg.lstsq(a, poly3[:, 2], rcond=None)[0]
+            z = float(cf[0] * x + cf[1] * y + cf[2])
+        except Exception:
+            z = float(poly3[:, 2].mean())
+        F.append({"p": fmt_pitch(pv), "t": ftypes[fi],
+                  "l": [round(float(x), 2), round(float(y), 2), round(-z + 0.0, 2)]})
+    A = []  # shaded facet outlines: [materialID, facetType, [point indices]]
+    for fi, (seg_ids, _) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or any(int(k) not in remap for k in loop):
+            continue
+        A.append([fmats[fi], ftypes[fi], [remap[int(k)] for k in loop]])
+    data = {
+        "A": A,
+        "mat": {str(k): v for k, v in MATERIAL_COLORS.items()},
+        "matNames": {str(k): v for k, v in MATERIAL_NAMES.items()},
+        "matAlphas": {str(k): v for k, v in MATERIAL_ALPHAS.items()},
+        "hole": HOLE_COLOR,
+        "holeAlpha": HOLE_ALPHA,
+        "roof": ROOF_COLOR,
+        "roofAlpha": ROOF_ALPHA,
+        "surf": SURFACE_COLOR,
+        "surfAlpha": SURFACE_ALPHA,
+        "P": (np.round(P, 2) + 0.0).tolist(),  # + 0.0 turns -0.0 into 0.0
+        "S": [[remap[int(ix[0])], remap[int(ix[1])], int(stype), sorted(seg_ftypes.get(n, []))]
+              for n, stype, ix in kept],
+        "F": F,
+        "colors": {str(k): v for k, v in SEG_COLORS.items()},
+        "names": {str(k): v for k, v in SEG_NAMES.items()},
+    }
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    log.info("Wrote 3D geometry: %d points, %d segments, %d facet labels -> %s",
+             len(P), len(data["S"]), len(F), out_path)
+
+
+def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=4200):
     """Draw the wireframe on top of the top-down photo (model x/y == photo pixels)."""
     import matplotlib.image as mpimg
-    import matplotlib.patheffects as pe
 
     img = mpimg.imread(img_path)
     h, w = img.shape[:2]
-    k = min(1.0, max_px / max(w, h))
+    k = min(3.0, max_px / max(w, h))
     log.info("Overlay on %s (%dx%d px, output scale %.2f, model scale %.2f)", img_path, w, h, k, scale)
     dpi = 100
     fig = plt.figure(figsize=(w * k / dpi, h * k / dpi), dpi=dpi, facecolor="black")
@@ -300,7 +458,6 @@ def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
             log.warning("Wireframe extent x %.0f..%.0f, y %.0f..%.0f does not fit the %dx%d photo - try --scale",
                         lo[0], hi[0], lo[1], hi[1], w, h)
 
-    halo = [pe.Stroke(linewidth=OVERLAY_HALO_WIDTH, foreground="white", alpha=0.85), pe.Normal()]
     drawn = 0
     for stype, ix in segs:
         if ix is None:
@@ -309,10 +466,10 @@ def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
         if not (ok[i] and ok[j]):
             continue
         ax.plot([xy[i, 0], xy[j, 0]], [xy[i, 1], xy[j, 1]], line_style(stype),
-                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH, path_effects=halo)
+                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0,
+                zorder=3)
         drawn += 1
-    ax.scatter(xy[ok, 0], xy[ok, 1], s=OVERLAY_POINT_SIZE, c="black", edgecolors="white",
-               linewidths=OVERLAY_POINT_EDGE, zorder=3)
     log.info("Drew %d segments on the photo (line width %.1f)", drawn, OVERLAY_LINE_WIDTH)
     ax.set_xlim(0, w)
     ax.set_ylim(h, 0)
@@ -328,13 +485,17 @@ def main():
     ap.add_argument("-o", "--output", default=None,
                     help="Output PNG (default: <evm_file>_topdown.png)")
     ap.add_argument("--no-pitch", action="store_true", help="Hide per-facet pitch labels")
-    ap.add_argument("--dpi", type=int, default=150)
+    ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging")
     ap.add_argument("-q", "--quiet", action="store_true", help="Only log warnings and errors")
     ap.add_argument("--overlay", default=None, metavar="IMAGE",
                     help="Draw the wireframe on top of this top-down photo instead")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="Multiply model x/y by this to match the photo's resolution (overlay only)")
+    ap.add_argument("--match-image", default=None, metavar="IMAGE",
+                    help="Match the plain wireframe canvas dimensions to this image")
+    ap.add_argument("--json3d", action="store_true",
+                    help="Write the 3D geometry as JSON (for the interactive 3D view) instead of a PNG")
     args = ap.parse_args()
 
     # Log to stdout (flushed per line) so the lines stay in order with the final
@@ -344,17 +505,20 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
                         handlers=[handler])
 
-    out = args.output or args.evm_file.rsplit(".", 1)[0] + "_topdown.png"
-    mode = "overlay" if args.overlay else "wireframe"
+    out = args.output or args.evm_file.rsplit(".", 1)[0] + ("_3d.json" if args.json3d else "_topdown.png")
+    mode = "3d" if args.json3d else "overlay" if args.overlay else "wireframe"
     log.info("Rendering %s for %s -> %s", mode, args.evm_file, out)
     t0 = time.perf_counter()
     try:
-        pts, segs, facets = load_geometry(args.evm_file)
-        if args.overlay:
+        pts, segs, facets, facet_types, facet_materials = load_geometry(args.evm_file, omit_infinite=not args.json3d)
+        if args.json3d:
+            export_3d(pts, segs, facets, out, facet_types, facet_materials)
+        elif args.overlay:
             plot_overlay(pts, segs, args.overlay, out, scale=args.scale)
         else:
             plot_top_down(pts, segs, facets, out,
-                          pitch=not args.no_pitch, dpi=args.dpi)
+                          pitch=not args.no_pitch, dpi=args.dpi,
+                          match_image=args.match_image, facet_types=facet_types)
     except Exception:
         log.exception("Failed to render %s", mode)
         sys.exit(1)

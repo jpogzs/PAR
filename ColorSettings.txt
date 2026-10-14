@@ -1,0 +1,16 @@
+﻿Inside Corner=#00FFFF
+Outside Corner=#A80000
+Obtuse Inside Corner=#00FF00
+Obtuse Outside Corner=#FF00FF
+Top Wall=#0000CC
+Bottom Wall=#006666
+Material Horizontal Boundary=#00AAEE
+Material Vertical Boundary=#C55500
+Material Oblique Boundary=#AA00EE
+Material Top=#0000CC
+Material Bottom=#009944
+Material Inside Corner=#00FFFF
+Material Outside Corner=#A80000
+Material Obtuse Inside Corner=#00FF00
+Material Obtuse Outside Corner=#E200AA
+Isoline=#666600
