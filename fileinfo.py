@@ -3,9 +3,13 @@ import os
 import json
 import shutil
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import scipy.io as sio
 import numpy as np
+
+# Start a new session if the gap between two consecutive events of the
+# same user exceeds this.
+SESSION_GAP = timedelta(hours=12)
 
 
 def first_elem(arr):
@@ -38,16 +42,23 @@ def parse_user_times(filelog):
     Log lines look like:
         'Opened by 1955ATTCT44 on 23.12.2022_07.25.55'
         'Saved by 4187JPTCT24 on 23.12.2022_09.11.08'
+        'Checkpoint 5.0 from TW by 7657LGTCT99 on 15.09.2026_15.35.25'
     A user may appear in multiple sessions (e.g. reworks). We group
-    consecutive actions by the same user into sessions and sum the
-    durations (last timestamp - first timestamp) of each session.
+    consecutive actions by the same user into sessions, and a session
+    is closed (ended) as soon as a Checkpoint line for that user is
+    processed -- the checkpoint's own timestamp becomes the session's
+    end time, and the very next event (even from the same user) starts
+    a brand-new session. A session is also closed whenever the user
+    changes, and when more than 12 hours pass between two consecutive
+    events of the same user. We sum the durations (last timestamp -
+    first timestamp) of each session.
     """
     # Match "by <USER> on <DD.MM.YYYY_HH.MM.SS>"
     pattern = re.compile(
         r"by\s+([A-Za-z0-9]+)\s+on\s+(\d{2}\.\d{2}\.\d{4}_\d{2}[.:]\d{2}[.:]\d{2})"
     )
 
-    events = []  # list of (user, datetime)
+    events = []  # list of (user, datetime, is_checkpoint)
     for line in filelog.splitlines():
         m = pattern.search(line)
         if not m:
@@ -58,7 +69,8 @@ def parse_user_times(filelog):
             ts = datetime.strptime(raw_ts, "%d.%m.%Y_%H.%M.%S")
         except ValueError:
             continue
-        events.append((user, ts))
+        is_checkpoint = "checkpoint" in line.lower()
+        events.append((user, ts, is_checkpoint))
 
     if not events:
         return {}
@@ -80,17 +92,30 @@ def parse_user_times(filelog):
             (session_start, session_end, secs)
         )
 
-    for user, ts in events:
+    for user, ts, is_checkpoint in events:
         if user != current_user:
             # a different user started -> close previous session
             close_session()
             current_user = user
             session_start = ts
             session_end = ts
+        elif ts - session_end > SESSION_GAP:
+            # same user, but more than 12h since their last event -> new session
+            close_session()
+            session_start = ts
+            session_end = ts
         else:
             # same user continues -> extend session end
             session_end = ts
-    close_session()  # close the final open session
+
+        if is_checkpoint:
+            # a checkpoint forces the current session to close here;
+            # the next event (even from the same user) starts a new session
+            close_session()
+            current_user = None
+            session_start = None
+            session_end = None
+    close_session()  # close the final open session (no-op if already closed)
 
     # Build a clean result structure
     def fmt(secs):
@@ -168,7 +193,7 @@ try:
     som       = ftypelist.count(17408)
 
     # --- Computed variables ---
-    Roof        = roof + pens + iapens
+    Roof        = roof
     Penetration = pens + iapens
     Wall        = wall + footprint + soffits + stamps + som
     Notes       = history
