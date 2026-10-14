@@ -14,7 +14,9 @@ param(
     # Keep the browser's normal CORS enforcement instead of relaxing it.
     [switch]$EnforceWebSecurity,
     # Force re-download of the WebView2 SDK assemblies even if cached.
-    [switch]$ForceWebView2Refresh
+    [switch]$ForceWebView2Refresh,
+    # Silence the terminal log (startup, requests, image/file-info/wireframe work, errors).
+    [switch]$Quiet
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
@@ -28,6 +30,29 @@ Copy-Item -Path "P:\1_Coordinators\PIA\PAR.lnk" `
           -Force -ErrorAction SilentlyContinue
 
 # ============================================================
+#  TERMINAL LOGGING
+# ============================================================
+# Timestamped, colour-coded lines in this PowerShell window showing what PAR is
+# doing: startup, access check, every local API request (with status + time),
+# image / file-info / wireframe work, python output, and errors from the page.
+# Run with -Quiet to silence it. Never throws.
+$ParLogEnabled = -not $Quiet
+function Write-ParLog {
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Message,
+        [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO',
+        [Parameter(Position = 2)][string]$Source = 'PAR'
+    )
+    if (-not $ParLogEnabled) { return }
+    try {
+        $color = switch ($Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'DEBUG' { 'DarkGray' } default { 'Cyan' } }
+        Write-Host ("[{0}] [{1,-5}] [{2}] {3}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Level, $Source, $Message) -ForegroundColor $color
+    }
+    catch { }
+}
+Write-ParLog "PAR starting (user $env:USERNAME on $env:COMPUTERNAME)" 'INFO' 'startup'
+
+# ============================================================
 #  USAGE LOGGING
 # ============================================================
 # Appends one line per launch to a shared CSV so PIA can see who is
@@ -38,6 +63,13 @@ function Write-ParUsageLog {
         [string]$Action  = 'Launch',
         [string]$Details = ''
     )
+    try {
+        $echoLevel = if ($Action -match 'Fail|Restricted') { 'WARN' } elseif ($Action -match 'Passed') { 'OK' } else { 'DEBUG' }
+        $echoText  = if ($Details) { "$Action | $Details" } else { $Action }
+        if ($echoText.Length -gt 220) { $echoText = $echoText.Substring(0, 220) + '...' }
+        Write-ParLog $echoText $echoLevel 'usage'
+    }
+    catch { }
     try {
         $logDir = Split-Path -Path $LogPath -Parent
         if (-not (Test-Path $logDir)) {
@@ -226,6 +258,8 @@ if (-not $allRolesResponse -or (-not ($allRolesResponse | Where-Object { $_.role
 Write-ParDebug "[DEBUG] RESULT: ACCESS GRANTED" -Color Green
 
 Write-ParUsageLog -Action 'RoleCheckPassed' -Details "userId=$userId; email=$userEmail"
+Write-ParLog 'Access check finished - terminal logging stops here.' 'INFO' 'PAR'
+$ParLogEnabled = $false   # everything after the role check stays quiet (also passed to the request runspaces)
 # >>> END TEMP DEBUG <<<
 
 # ============================================================================
@@ -283,8 +317,11 @@ PIA members: Pogi, LT, Rona
     </div>
   </div>
   <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
-    <button class="image-lightbox-close" id="imageLightboxClose" title="Close" aria-label="Close">×</button>
+    <button class="image-lightbox-close" id="imageLightboxClose" title="Close (Esc)" aria-label="Close">×</button>
+    <button class="image-lightbox-nav image-lightbox-prev" id="imageLightboxPrev" title="Previous image (←)" aria-label="Previous image">‹</button>
     <img id="imageLightboxImg" src="" alt="Report image full size">
+    <button class="image-lightbox-nav image-lightbox-next" id="imageLightboxNext" title="Next image (→)" aria-label="Next image">›</button>
+    <div class="image-lightbox-caption" id="imageLightboxCaption"></div>
   </div>
   <div class="par-tab-bar">
     <div class="tab-logo-block">
@@ -895,20 +932,20 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-overlay.open .detail-modal { transform: translateY(0) scale(1); opacity: 1; }
 .detail-modal-header {
   display: flex; align-items: flex-start; justify-content: space-between;
-  padding: 16px 18px; border-bottom: 1px solid var(--border-light);
+  padding: 9px 18px; border-bottom: 1px solid var(--border-light);
   background: var(--bg-surface); flex-shrink: 0;
 }
 .detail-modal-title { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-primary); }
-.detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.03em; }
+.detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 2px; letter-spacing: 0.03em; }
 .detail-product-line { font-size: 12px; color: var(--text-secondary); font-family: var(--sans); }
 .detail-folder-name { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.02em; word-break: break-word; }
 .detail-close-btn {
   border: none; background: transparent; color: var(--text-muted);
-  font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px;
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 0 6px;
   border-radius: 6px; transition: background 0.12s, color 0.12s;
 }
 .detail-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-.detail-images-section { flex-shrink: 0; max-height: 200px; overflow-y: auto; padding: 12px 18px 0; }
+.detail-images-section { flex-shrink: 0; max-height: min(400px, 48vh); overflow-y: auto; padding: 8px 18px 0; }
 .detail-tabs { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px 0; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
 .detail-tabs-list { display: flex; gap: 4px; }
 .detail-tabs-actions { display: flex; gap: 6px; margin-bottom: 8px; }
@@ -927,7 +964,7 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-modal-body { flex: 1 1 auto; min-height: 0; padding: 6px 18px 18px; overflow-y: auto; }
 .detail-modal-footer {
   display: flex; align-items: center; justify-content: flex-end; gap: 10px;
-  padding: 12px 18px; border-top: 1px solid var(--border-light);
+  padding: 5px 18px; border-top: 1px solid var(--border-light);
   background: var(--bg-surface); flex-shrink: 0;
 }
 .detail-footer-meta {
@@ -1028,18 +1065,22 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
   letter-spacing: 0.02em; color: var(--text-muted); margin-left: 8px;
 }
 .detail-images-grid {
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+  display: grid; grid-template-columns: repeat(12, 1fr); gap: 8px;
 }
 @media (max-width: 480px) {
   .detail-images-grid { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
 }
 .detail-image-thumb {
-  position: relative; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden;
+  position: relative; grid-column: span 3; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden;
   background: var(--bg-card); border: 1px solid var(--border-light); cursor: pointer;
 }
 .detail-image-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.15s ease; }
 .detail-image-thumb:hover img { transform: scale(1.06); }
 .detail-image-thumb.img-error { display: none; }
+.detail-feature-thumb { grid-column: span 4; aspect-ratio: 4 / 3; }
+.detail-feature-thumb img { object-fit: contain; }
+.detail-overlay-thumb { background: #000; }
+@media (max-width: 480px) { .detail-image-thumb, .detail-feature-thumb { grid-column: auto; } }
 .detail-image-skel {
   cursor: default;
   background: linear-gradient(90deg, var(--bg-card) 0%, var(--bg-hover) 40%, var(--bg-card) 80%);
@@ -1047,18 +1088,56 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
   animation: skeleton-shimmer 1.6s ease-in-out infinite;
 }
 .detail-images-empty { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0; }
+.detail-wireframe-thumb { background: #fff; }
+.detail-wireframe-thumb img { object-fit: contain; background: #fff; }
+.detail-wireframe-thumb:hover img { transform: none; }
+.detail-wireframe-badge {
+  position: absolute; left: 4px; bottom: 4px; padding: 1px 6px; border-radius: 3px;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+  background: rgba(10,77,140,0.88); color: #fff; pointer-events: none;
+}
+.detail-wireframe-reason { margin-top: 4px; font-size: 8px; line-height: 1.25; word-break: break-word; opacity: 0.85; }
+.detail-wireframe-error {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  padding: 6px; font-size: 10px; color: var(--text-muted); cursor: default; background: var(--bg-card);
+}
 .image-lightbox {
   position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.82);
   display: flex; align-items: center; justify-content: center;
   opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
 }
 .image-lightbox.open { opacity: 1; pointer-events: auto; }
-.image-lightbox img { max-width: 90vw; max-height: 88vh; border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5); }
+.image-lightbox { overflow: hidden; }
+/* Every preview image is shown at the same height (the wireframe canvas is square, so it fills this height). */
+.image-lightbox img {
+  height: 88vh; width: auto; max-width: 94vw; object-fit: contain;
+  border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5);
+  transform-origin: 50% 50%; will-change: transform; user-select: none; -webkit-user-drag: none;
+}
+.image-lightbox img.zoomed { cursor: grab; }
+.image-lightbox img.dragging { cursor: grabbing; }
+.image-lightbox-close, .image-lightbox-nav, .image-lightbox-caption { z-index: 2; }
 .image-lightbox-close {
   position: absolute; top: 18px; right: 24px; border: none; background: transparent; color: #fff;
   font-size: 28px; cursor: pointer; line-height: 1; padding: 4px 10px; border-radius: 6px;
 }
 .image-lightbox-close:hover { background: rgba(255,255,255,0.12); }
+.image-lightbox-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 46px; height: 68px; border: none; border-radius: 8px;
+  background: rgba(255,255,255,0.10); color: #fff;
+  font-size: 38px; line-height: 1; cursor: pointer; padding: 0 0 4px;
+  transition: background 0.12s;
+}
+.image-lightbox-nav:hover { background: rgba(255,255,255,0.24); }
+.image-lightbox-prev { left: 18px; }
+.image-lightbox-next { right: 18px; }
+.image-lightbox-caption {
+  position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+  padding: 3px 14px; border-radius: 12px; background: rgba(0,0,0,0.6); color: #fff;
+  font-family: var(--sans); font-size: 12px; letter-spacing: 0.03em; white-space: nowrap;
+  pointer-events: none;
+}
 .par-table td {
   padding:7px 12px; color:var(--text-primary);
   text-align:center; vertical-align:middle; border:none;
@@ -1776,6 +1855,30 @@ $ParJs = @'
 /* ============================================================================
    Created and developed by PIA — members: Pogi, LT, Rona
    ============================================================================ */
+/* ── TERMINAL LOG BRIDGE ──
+   parLog(level, message) forwards a line to the PowerShell window (level: info|ok|warn|error).
+   console.error / console.warn and uncaught errors are forwarded too. Never throws. */
+function parLog(level, message){
+  try {
+    const text = String(message == null ? '' : message).slice(0, 600);
+    if (window.chrome && window.chrome.webview) {
+      window.chrome.webview.postMessage(JSON.stringify({ level: level, message: text }));
+    }
+  } catch (e) { /* logging must never break the UI */ }
+}
+(function hookConsoleForTerminal(){
+  const origError = console.error.bind(console);
+  const origWarn  = console.warn.bind(console);
+  const fmt = args => Array.from(args).map(a => {
+    if (a && a.message) return a.message;
+    if (a && typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+    return String(a);
+  }).join(' ');
+  console.error = function(){ origError.apply(null, arguments); parLog('error', fmt(arguments)); };
+  console.warn  = function(){ origWarn.apply(null, arguments);  parLog('warn',  fmt(arguments)); };
+  window.addEventListener('error', e => parLog('error', `Uncaught: ${e.message} (${e.filename || ''}:${e.lineno || 0})`));
+  window.addEventListener('unhandledrejection', e => parLog('error', `Unhandled promise rejection: ${(e.reason && e.reason.message) ? e.reason.message : e.reason}`));
+})();
 /* ── SERVER TIMEZONE ── */
 const SERVER_TZ = 'America/Los_Angeles';
 function getLAOffsetMs(dateForContext) {
@@ -1826,6 +1929,14 @@ let q_trainingFetched = false;
 /* ── ROW DETAIL STORE ── */
 const rowDetailsStore = {};
 let imageLoadToken = 0;
+let wireframeToken = 0;
+// Generated tiles shown after the top-down image: the plain wireframe and the
+// wireframe drawn over the top-down photo.
+const WF_TILES = {
+  wireframe: { id: 'detailWireframeThumb', label: 'Wireframe', query: '',           cls: 'detail-wireframe-thumb', loading: 'Generating wireframe…' },
+  overlay:   { id: 'detailOverlayThumb',   label: 'Overlay',   query: '&overlay=1', cls: 'detail-overlay-thumb',   loading: 'Generating overlay…' }
+};
+const wireframeStates = {};
 let fileInfoLoadToken = 0;
 /* ── DOMContentLoaded ── */
 document.addEventListener('DOMContentLoaded', () => {
@@ -1975,13 +2086,54 @@ document.querySelector('.detail-modal')?.addEventListener('click', e => {
     tab.addEventListener('click', () => switchDetailTab(tab.dataset.tab));
   });
   document.getElementById('imageLightboxClose')?.addEventListener('click', closeImageLightbox);
+  (function wireLightboxZoom(){
+    const lbEl  = document.getElementById('imageLightbox');
+    const imgEl = document.getElementById('imageLightboxImg');
+    if (!lbEl || !imgEl) return;
+    imgEl.draggable = false;
+    lbEl.addEventListener('wheel', e => {
+      if (!lbEl.classList.contains('open')) return;
+      e.preventDefault();
+      zoomLightboxAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+    }, { passive: false });
+    let drag = null;
+    imgEl.addEventListener('mousedown', e => {
+      if (lbZoom.s <= 1 || e.button !== 0) return;
+      e.preventDefault();
+      drag = { sx: e.clientX, sy: e.clientY, ox: lbZoom.x, oy: lbZoom.y };
+      lightboxDragged = false;
+      imgEl.classList.add('dragging');
+    });
+    document.addEventListener('mousemove', e => {
+      if (!drag) return;
+      const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 3) lightboxDragged = true;
+      lbZoom.x = drag.ox + dx; lbZoom.y = drag.oy + dy;
+      applyLightboxZoom();
+    });
+    document.addEventListener('mouseup', () => {
+      if (!drag) return;
+      drag = null;
+      imgEl.classList.remove('dragging');
+      setTimeout(() => { lightboxDragged = false; }, 0);   // swallow the click that ends a drag
+    });
+    imgEl.addEventListener('dblclick', resetLightboxZoom);
+  })();
+  document.getElementById('imageLightboxPrev')?.addEventListener('click', () => stepImageLightbox(-1));
+  document.getElementById('imageLightboxNext')?.addEventListener('click', () => stepImageLightbox(1));
   document.getElementById('imageLightbox')?.addEventListener('click', e => {
-    if (e.target.id === 'imageLightbox') closeImageLightbox();
+    if (e.target.id === 'imageLightbox' && !lightboxDragged) closeImageLightbox();
   });
   document.addEventListener('keydown', e => {
-    if (e.key !== 'Escape') return;
     const lb = document.getElementById('imageLightbox');
-    if (lb && lb.classList.contains('open')) closeImageLightbox();
+    const lightboxOpen = !!(lb && lb.classList.contains('open'));
+    // With an image open in the preview, Left/Right step to the previous/next image.
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      if (lightboxOpen) { e.preventDefault(); stepImageLightbox(e.key === 'ArrowRight' ? 1 : -1); }
+      return;
+    }
+    if (e.key !== 'Escape') return;
+    if (lightboxOpen) closeImageLightbox();
     else closeReportDetailModal();
   });
 });
@@ -2452,6 +2604,7 @@ function openReportDetailModal(details){
   const title   = document.getElementById('detailModalTitle');
   const sub     = document.getElementById('detailModalSubtitle');
   if (!overlay || !body) return;
+  parLog('info', `Report #${details.reportID} opened (${details.source || '?'}, ${details.appLabel || '?'}, ${details.stateLabel || '?'})`);
   const typeLabel = details.isTraining ? 'Training' : 'Live';
   title.innerHTML = `Report #${details.reportID}`;
   sub.innerHTML = `<div id="detailFolderName" class="detail-folder-name"></div>`;
@@ -2604,7 +2757,10 @@ function openReportDetailModal(details){
   }
   const imagesGrid = document.getElementById('detailImagesGrid');
   const imagesStatus = document.getElementById('detailImagesStatus');
+  resetWireframe();
+  if (isTwisterFileInfo) markWireframePending();
   if (imagesGrid) imagesGrid.innerHTML = buildImageSkeletons();
+  if (isTwisterFileInfo) renderWireframeThumb();
   if (imagesStatus) imagesStatus.textContent = 'Searching…';
   switchDetailTab('overview');
   // Size the modal to fit the Overview tab's content with no internal
@@ -2847,14 +3003,117 @@ async function copyTextToClipboard(text){
     if (e.key === 'Escape') closeMenu();
   });
 })();
-function buildImageSkeletons(count = 5){
-  return Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
+function buildImageSkeletons(count = 4){
+  // Same layout as the loaded grid: Ortho (top) first, then 4 photo slots. The Wireframe and
+  // Overlay placeholders are inserted after the Ortho slot by renderWireframeThumb().
+  const ortho = `<div class="detail-image-thumb detail-feature-thumb detail-topdown-thumb detail-image-skel" title="Loading top-down image…"><span class="detail-wireframe-badge">Ortho (top)</span></div>`;
+  return ortho + Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
 }
 function getEvmBaseName(filePath){
   if (!filePath) return '';
   const parts = String(filePath).split(/[\\\/]/);
   const fileName = parts[parts.length - 1] || '';
   return fileName.replace(/\.evm$/i, '');
+}
+/* Generated roof wireframe (top-down, from the latest rollback .evm). It is
+   rendered as the first tile of the Images grid. Because loadReportImages()
+   rewrites the grid, the tile is driven by wireframeState and re-applied
+   after every grid rewrite, so the order the two requests finish in
+   doesn't matter. */
+function resetWireframe(){
+  wireframeToken++;
+  Object.keys(WF_TILES).forEach(kind => {
+    const st = wireframeStates[kind];
+    if (st && st.src) { try { URL.revokeObjectURL(st.src); } catch {} }
+    wireframeStates[kind] = { status: 'idle', src: null, error: '', detail: '' };
+    const el = document.getElementById(WF_TILES[kind].id);
+    if (el) el.remove();
+  });
+}
+// Twister reports: show Wireframe/Overlay placeholder boxes right away (before the EVM is located).
+function markWireframePending(){
+  Object.keys(WF_TILES).forEach(kind => { wireframeStates[kind] = { status: 'pending', src: null, error: '', detail: '' }; });
+}
+// If the EVM can't be found, turn any still-pending placeholder into an "unavailable" tile.
+function settleWireframe(reason){
+  let changed = false;
+  Object.keys(WF_TILES).forEach(kind => {
+    const st = wireframeStates[kind];
+    if (st && st.status === 'pending') {
+      wireframeStates[kind] = { status: 'error', src: null, error: reason || 'No EVM file found', detail: '' };
+      changed = true;
+    }
+  });
+  if (changed) renderWireframeThumb();
+}
+function renderWireframeThumb(){
+  const grid = document.getElementById('detailImagesGrid');
+  if (!grid) return;
+  // Order: top-down image, wireframe, overlay, then the remaining photos.
+  let prev = grid.querySelector('.detail-topdown-thumb');
+  Object.keys(WF_TILES).forEach(kind => {
+    const cfg = WF_TILES[kind];
+    const st = wireframeStates[kind] || { status: 'idle' };
+    let el = document.getElementById(cfg.id);
+    if (st.status === 'idle') { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = cfg.id; }
+    grid.insertBefore(el, prev ? prev.nextSibling : grid.firstChild);
+    prev = el;
+    if (st.status === 'loading' || st.status === 'pending') {
+      el.className = 'detail-image-thumb detail-feature-thumb detail-image-skel';
+      el.title = cfg.loading;
+      el.innerHTML = `<span class="detail-wireframe-badge">${cfg.label}</span>`;
+    } else if (st.status === 'error') {
+      el.className = 'detail-image-thumb detail-wireframe-error';
+      el.title = st.detail || st.error || (cfg.label + ' unavailable');
+      const reason = String(st.error || '');
+      el.innerHTML = `<div><div>${cfg.label} unavailable</div><div class="detail-wireframe-reason">${escapeHtml(reason.length > 90 ? reason.slice(0, 90) + '…' : reason)}</div></div>`;
+    } else {
+      el.className = `detail-image-thumb detail-feature-thumb ${cfg.cls}`;
+      el.title = cfg.label;
+      el.innerHTML = `<img src="${st.src}" alt="${cfg.label}"><span class="detail-wireframe-badge">${cfg.label}</span>`;
+    }
+  });
+  lockModalHeightToOverview();
+}
+function startWireframe(evmPath){
+  if (!evmPath) return;
+  const myToken = ++wireframeToken;
+  Object.keys(WF_TILES).forEach(kind => {
+    const old = wireframeStates[kind];
+    if (old && old.src) { try { URL.revokeObjectURL(old.src); } catch {} }
+    wireframeStates[kind] = { status: 'loading', src: null, error: '', detail: '' };
+  });
+  renderWireframeThumb();
+  Object.keys(WF_TILES).forEach(kind => {
+    fetch(`/api/wireframe?evm=${encodeURIComponent(evmPath)}${WF_TILES[kind].query}`)
+      .then(r => {
+        const type = r.headers.get('content-type') || '';
+        if (r.ok && type.startsWith('image/')) return r.blob().then(b => ({ blob: b }));
+        return r.json().catch(() => ({})).then(j => ({
+          error: (j && (j.error || j.message)) || `HTTP ${r.status}`,
+          detail: (j && j.detail) || '',
+          code: (j && j.code) || ''
+        }));
+      })
+      .then(res => {
+        if (myToken !== wireframeToken) return;
+        if (res.blob) wireframeStates[kind] = { status: 'ready', src: URL.createObjectURL(res.blob), error: '', detail: '' };
+        else if (res.code === 'no-topdown') wireframeStates[kind] = { status: 'idle', src: null, error: '', detail: '' };
+        else wireframeStates[kind] = { status: 'error', src: null, error: res.error, detail: res.detail || '' };
+        {
+          const st = wireframeStates[kind];
+          parLog(st.status === 'error' ? 'warn' : (st.status === 'ready' ? 'ok' : 'info'),
+            `${WF_TILES[kind].label}: ${st.status === 'idle' ? 'skipped (no top-down photo)' : st.status}${st.error ? ' - ' + st.error : ''}`);
+        }
+        renderWireframeThumb();
+      })
+      .catch(() => {
+        if (myToken !== wireframeToken) return;
+        wireframeStates[kind] = { status: 'error', src: null, error: "Couldn't reach the local wireframe service.", detail: '' };
+        renderWireframeThumb();
+      });
+  });
 }
 function loadReportImages(reportId, locationName, folderName){
   const myToken = ++imageLoadToken;
@@ -2871,10 +3130,20 @@ function loadReportImages(reportId, locationName, folderName){
       if (data && data.found && Array.isArray(data.images) && data.images.length) {
         if (status) status.textContent = '';
         if (folderNameEl) folderNameEl.textContent = data.folder || '';
-        grid.innerHTML = data.images.map(src => `
-          <div class="detail-image-thumb">
-            <img src="${src}" alt="Report image" loading="eager" decoding="async" fetchpriority="high" onerror="this.closest('.detail-image-thumb').classList.add('img-error')">
-          </div>`).join('');
+        // Top-down (O_****_**.jpg) is featured first; the wireframe tile is
+        // inserted right after it (see renderWireframeThumb), then the rest.
+        // Each photo gets a badge like the Wireframe/Overlay tiles: Ortho (top), North, East, West, South.
+        const imageLabels = Array.isArray(data.imageLabels) ? data.imageLabels : [];
+        grid.innerHTML = data.images.map((src, idx) => {
+          const isTop = !!data.topDown && src === data.topDown;
+          const label = imageLabels[idx] || (isTop ? 'Ortho (top)' : '');
+          return `
+          <div class="detail-image-thumb${isTop ? ' detail-feature-thumb detail-topdown-thumb' : ''}">
+            <img src="${src}" alt="${escapeHtml(label || (isTop ? 'Top-down image' : 'Report image'))}" loading="eager" decoding="async" fetchpriority="high" onerror="this.closest('.detail-image-thumb').classList.add('img-error');parLog('warn','Image failed to load: ${escapeHtml(label || 'image')}')">
+            ${label ? `<span class="detail-wireframe-badge">${escapeHtml(label)}</span>` : ''}
+          </div>`;
+        }).join('');
+        parLog('info', `Report ${reportId}: ${data.images.length} image(s) from ${data.folder || 'archive folder'}`);
       } else if (data && data.found) {
         if (status) status.textContent = '';
         if (folderNameEl) folderNameEl.textContent = data.folder || '';
@@ -2884,12 +3153,14 @@ function loadReportImages(reportId, locationName, folderName){
         if (folderNameEl) folderNameEl.textContent = '';
         grid.innerHTML = `<div class="detail-images-empty">${escapeHtml((data && (data.message || data.error)) || 'No matching report folder found.')}</div>`;
       }
+      renderWireframeThumb();
       lockModalHeightToOverview();
     })
     .catch(() => {
       if (myToken !== imageLoadToken) return;
       if (status) status.textContent = '';
       grid.innerHTML = `<div class="detail-images-empty">Couldn't reach the archive share. Check your network/VPN connection.</div>`;
+      renderWireframeThumb();
       lockModalHeightToOverview();
     });
 }
@@ -2938,6 +3209,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     const message = (isQc ? 'QC ID' : 'Tech ID') + ' or team not available for this report yet.';
     setFields(message, true);
     if (hasReworkCount) setValue(notesEl, message, true);
+    settleWireframe(message);
     loadReportImages(reportId, locationName);
     return;
   }
@@ -2955,6 +3227,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     .then(data => {
       if (myToken !== fileInfoLoadToken) return;
       if (data && data.found) {
+        parLog('ok', `EVM data for ${reportId}: rollback ${data.rollback || '?'}${data.cached ? ' (cached)' : ''}`);
         let parsed = null;
         try { parsed = JSON.parse(data.output || '{}'); } catch { parsed = null; }
         if (parsed) {
@@ -2990,12 +3263,14 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
         // Twister's .evm filename (minus extension) is the exact archive
         // folder name, so go straight there instead of scanning the share.
         const evmBaseName = getEvmBaseName(data.filePath);
+        startWireframe(data.filePath);
         loadReportImages(reportId, locationName, evmBaseName);
       } else {
         // "No rollback found" isn't useful on its own — show the short
         // two-level box path (e.g. "2027JHTCT79\InProgress") instead so the
         // person can see exactly where the .evm was expected to be.
         const shortPath = data && data.searchedPath;
+        parLog('warn', `EVM data for ${reportId}: ${(data && (data.searchedPath || data.message || data.error)) || 'not available'}`);
         const notFoundMessage = shortPath
           ? `EVM not found in ${shortPath}`
           : ((data && (data.message || data.error)) || 'File info not available.');
@@ -3003,6 +3278,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
           ? `EVM not found in ${shortenPathForNotes(shortPath)}`
           : notFoundMessage;
         setFields(notFoundMessage, true);
+        settleWireframe(notFoundMessage);
         if (hasReworkCount) setValue(notesEl, notesNotFoundMessage, true);
         // No filename to go on — fall back to the archive search by report ID.
         loadReportImages(reportId, locationName);
@@ -3012,25 +3288,102 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
       if (myToken !== fileInfoLoadToken) return;
       const message = "Couldn't reach the local file-info service.";
       setFields(message, true);
+      settleWireframe(message);
       if (hasReworkCount) setValue(notesEl, message, true);
       loadReportImages(reportId, locationName);
     });
+}
+/* Image preview (lightbox). Left/Right arrow keys (or the on-screen < > buttons) step through
+   every visible tile of the Images grid in grid order, wrapping around:
+   Ortho (top) -> Wireframe -> Overlay -> North -> East -> West -> South. */
+let lightboxSrc = '';
+let lightboxIndex = 0;
+function getLightboxItems(){
+  const grid = document.getElementById('detailImagesGrid');
+  if (!grid) return [];
+  return Array.from(grid.querySelectorAll('.detail-image-thumb:not(.img-error) img'))
+    .filter(img => img.getAttribute('src'))
+    .map(img => {
+      const badge = img.parentElement && img.parentElement.querySelector('.detail-wireframe-badge');
+      return { src: img.getAttribute('src'), label: badge ? badge.textContent.trim() : '' };
+    });
+}
+function showLightboxItem(item, index, total){
+  const img = document.getElementById('imageLightboxImg');
+  const cap = document.getElementById('imageLightboxCaption');
+  if (!img || !item) return;
+  lightboxSrc = item.src;
+  lightboxIndex = index;
+  resetLightboxZoom();
+  img.src = item.src;
+  img.alt = item.label || 'Report image full size';
+  if (cap) {
+    const parts = [];
+    if (item.label) parts.push(item.label);
+    if (total > 1) parts.push(`${index + 1} / ${total}`);
+    cap.textContent = parts.join('  ·  ');
+    cap.style.display = parts.length ? '' : 'none';
+  }
+  document.querySelectorAll('.image-lightbox-nav').forEach(b => { b.style.display = total > 1 ? '' : 'none'; });
 }
 function openImageLightbox(src){
   const lb  = document.getElementById('imageLightbox');
   const img = document.getElementById('imageLightboxImg');
   if (!lb || !img) return;
-  img.src = src;
+  const items = getLightboxItems();
+  const idx = items.findIndex(it => it.src === src);
+  showLightboxItem(idx >= 0 ? items[idx] : { src: src, label: '' }, Math.max(idx, 0), idx >= 0 ? items.length : 1);
   lb.classList.add('open');
   lb.setAttribute('aria-hidden', 'false');
+  parLog('info', `Preview opened: ${idx >= 0 && items[idx].label ? items[idx].label : 'image'} (${Math.max(idx, 0) + 1}/${items.length || 1})`);
+}
+function stepImageLightbox(delta){
+  const lb = document.getElementById('imageLightbox');
+  if (!lb || !lb.classList.contains('open')) return;
+  const items = getLightboxItems();
+  if (items.length < 2) return;
+  let idx = items.findIndex(it => it.src === lightboxSrc);
+  if (idx < 0) idx = Math.min(lightboxIndex, items.length - 1);
+  idx = (idx + delta + items.length) % items.length;
+  showLightboxItem(items[idx], idx, items.length);
+  parLog('info', `Preview: ${items[idx].label || 'image'} (${idx + 1}/${items.length})`);
+  // Warm the neighbours so the next arrow press is instant.
+  [1, -1].forEach(d => { const n = items[(idx + d + items.length) % items.length]; if (n) { const pre = new Image(); pre.src = n.src; } });
 }
 function closeImageLightbox(){
   const lb = document.getElementById('imageLightbox');
   if (!lb) return;
   lb.classList.remove('open');
   lb.setAttribute('aria-hidden', 'true');
+  lightboxSrc = '';
+  resetLightboxZoom();
   const img = document.getElementById('imageLightboxImg');
   if (img) img.src = '';
+}
+/* Mouse wheel zooms the preview toward the cursor (1x-8x); drag pans while zoomed; double-click resets. */
+let lbZoom = { s: 1, x: 0, y: 0 };
+let lightboxDragged = false;
+function applyLightboxZoom(){
+  const img = document.getElementById('imageLightboxImg');
+  if (!img) return;
+  img.style.transform = (lbZoom.s === 1 && !lbZoom.x && !lbZoom.y) ? '' : `translate(${lbZoom.x}px, ${lbZoom.y}px) scale(${lbZoom.s})`;
+  img.classList.toggle('zoomed', lbZoom.s > 1);
+}
+function resetLightboxZoom(){ lbZoom = { s: 1, x: 0, y: 0 }; applyLightboxZoom(); }
+function zoomLightboxAt(clientX, clientY, factor){
+  const lb = document.getElementById('imageLightbox');
+  if (!lb) return;
+  const r  = lb.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;   // the image is centred in the lightbox
+  const s0 = lbZoom.s;
+  const s1 = Math.min(8, Math.max(1, s0 * factor));
+  if (s1 === s0) return;
+  if (s1 === 1) lbZoom = { s: 1, x: 0, y: 0 };
+  else {
+    const k = s1 / s0;
+    lbZoom = { s: s1, x: (clientX - cx) - k * (clientX - cx - lbZoom.x), y: (clientY - cy) - k * (clientY - cy - lbZoom.y) };
+  }
+  applyLightboxZoom();
 }
 function closeReportDetailModal(){
   const overlay = document.getElementById('reportDetailOverlay');
@@ -3040,6 +3393,7 @@ function closeReportDetailModal(){
   closeImageLightbox();
   imageLoadToken++;
   fileInfoLoadToken++;
+  resetWireframe();
   document.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
 }
 /* ============================================================================
@@ -3901,15 +4255,18 @@ let q_pendingFetches=0, q_fileCount=0;
 # whatever the tool itself does. Same fix as the WebView2 SDK below: fetch
 # once, cache locally, and only re-copy if the share's copy is newer.
 function Get-FileInfoExeLocal {
+    # TEMP: now resolves fileinfo.py (run through Python) instead of fileinfo.exe.
+    # Variable/function names are unchanged so it is easy to switch back later.
     $cacheDir   = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
-    $localExe   = Join-Path $cacheDir 'fileinfo.exe'
-    $remoteBase = 'P:\1_Coordinators\PIA\fileinfo'
-    $remoteExe  =
-        if (Test-Path -LiteralPath "$remoteBase.exe" -PathType Leaf) { "$remoteBase.exe" }
-        elseif (Test-Path -LiteralPath $remoteBase -PathType Leaf) { $remoteBase }
-        else { $null }
+    $localExe   = Join-Path $cacheDir 'fileinfo.py'
+    $remoteExe  = 'P:\1_Coordinators\PIA\fileinfo\fileinfo.py'
+    if (-not (Test-Path -LiteralPath $remoteExe -PathType Leaf)) {
+        # Also accept the script sitting next to the old exe location.
+        $alt = 'P:\1_Coordinators\PIA\fileinfo.py'
+        $remoteExe = if (Test-Path -LiteralPath $alt -PathType Leaf) { $alt } else { $null }
+    }
     if (-not $remoteExe) {
-        # Share unreachable / tool missing — fall back to any already-cached
+        # Share unreachable / script missing - fall back to any already-cached
         # local copy rather than failing outright.
         if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
         return $null
@@ -3923,9 +4280,89 @@ function Get-FileInfoExeLocal {
         }
     }
     catch {
-        # Copy failed (offline, permissions, etc.) — use whatever's cached, if anything.
+        # Copy failed (offline, permissions, etc.) - use whatever's cached, if anything.
     }
     if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
+    return $null
+}
+# Finds a working Python interpreter for fileinfo.py. Candidates come from PATH,
+# the py launcher, and common per-user / system install folders. Each candidate
+# is actually run: it must start and be able to import scipy + numpy. If none
+# have the packages, the first one that merely runs is returned (the error from
+# the missing package then shows up in the File Info output instead of a
+# generic "Python not found"). Microsoft Store stubs fail the run test and are
+# skipped automatically; a real Store-installed Python is accepted.
+function Get-PythonExeLocal {
+    # Native stderr (warnings, Store-stub messages) must not become terminating
+    # errors here, even though the script-level preference is 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($name in 'python', 'python3', 'py') {
+        foreach ($cmd in @(Get-Command $name -CommandType Application -ErrorAction SilentlyContinue)) {
+            if ($cmd.Source) { $candidates.Add($cmd.Source) }
+        }
+    }
+    $globs = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python3*\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\python3.exe'),
+        (Join-Path $env:ProgramFiles 'Python3*\python.exe'),
+        'C:\Python3*\python.exe',
+        'C:\ProgramData\anaconda3\python.exe',
+        'C:\ProgramData\miniconda3\python.exe',
+        (Join-Path $env:USERPROFILE 'anaconda3\python.exe'),
+        (Join-Path $env:USERPROFILE 'miniconda3\python.exe'),
+        (Join-Path $env:WINDIR 'py.exe')
+    )
+    foreach ($g in $globs) {
+        foreach ($f in @(Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+            $candidates.Add($f.FullName)
+        }
+    }
+    # Preference order: scipy+numpy+matplotlib (fileinfo + wireframe both work)
+    # > scipy+numpy (fileinfo only) > any Python 3 that runs.
+    $noMpl = $null
+    $firstRunnable = $null
+    foreach ($exe in ($candidates | Select-Object -Unique)) {
+        try {
+            $out = (& $exe -c "import scipy, numpy, matplotlib; print('PAR_OK')" 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $out -match 'PAR_OK') { return $exe }
+            if (-not $noMpl) {
+                $out = (& $exe -c "import scipy, numpy; print('PAR_OK')" 2>&1 | Out-String)
+                if ($LASTEXITCODE -eq 0 -and $out -match 'PAR_OK') { $noMpl = $exe; continue }
+            }
+            if (-not $firstRunnable) {
+                $ver = (& $exe --version 2>&1 | Out-String)
+                if ($LASTEXITCODE -eq 0 -and $ver -match 'Python 3') { $firstRunnable = $exe }
+            }
+        }
+        catch { }
+    }
+    if ($noMpl) { return $noMpl }
+    return $firstRunnable
+}
+# Same share-to-local-cache idea as Get-FileInfoExeLocal, for any helper script
+# kept next to fileinfo.py on the PIA share (e.g. roof_wireframe.py).
+function Get-PiaScriptLocal {
+    param([Parameter(Mandatory)][string]$FileName)
+    $cacheDir = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
+    $local    = Join-Path $cacheDir $FileName
+    $remote   = $null
+    foreach ($p in @("P:\1_Coordinators\PIA\fileinfo\$FileName", "P:\1_Coordinators\PIA\$FileName")) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) { $remote = $p; break }
+    }
+    if ($remote) {
+        try {
+            $needsCopy = (-not (Test-Path -LiteralPath $local -PathType Leaf)) -or
+                         ((Get-Item -LiteralPath $remote).LastWriteTime -gt (Get-Item -LiteralPath $local).LastWriteTime)
+            if ($needsCopy) {
+                New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+                Copy-Item -LiteralPath $remote -Destination $local -Force
+            }
+        }
+        catch { }
+    }
+    if (Test-Path -LiteralPath $local -PathType Leaf) { return $local }
     return $null
 }
 # ============================================================================
@@ -4022,11 +4459,13 @@ try {
     $listener.Start()
 }
 catch {
+    Write-ParLog "Couldn't start the local server on ${prefix}: $($_.Exception.Message)" 'ERROR' 'server'
     [System.Windows.MessageBox]::Show(
         "Couldn't start the local server on ${prefix}:`n$($_.Exception.Message)",
         'PAR — startup failed', 'OK', 'Error') | Out-Null
     exit 1
 }
+Write-ParLog "Local server listening on $prefix" 'OK' 'server'
 # Requests are handled by a small pool of runspaces (instead of one runspace
 # processing requests one at a time), so things like "Images" and "File Info"
 # — both fired the instant the detail popup opens — actually run at the same
@@ -4038,6 +4477,394 @@ $FolderCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object
 # pooled request just uses the cached local path instead of re-resolving
 # it — and re-hitting the share — per request.
 $FileInfoExeLocal = Get-FileInfoExeLocal
+$PythonExeLocal   = Get-PythonExeLocal
+if ($FileInfoExeLocal) { Write-ParLog "fileinfo script: $FileInfoExeLocal" 'INFO' 'startup' }
+else { Write-ParLog 'fileinfo script NOT found (P:\1_Coordinators\PIA\fileinfo\fileinfo.py) - EVM Data will be unavailable' 'WARN' 'startup' }
+if ($PythonExeLocal) { Write-ParLog "python: $PythonExeLocal" 'INFO' 'startup' }
+else { Write-ParLog 'Python 3 NOT found - EVM Data and wireframes will be unavailable' 'WARN' 'startup' }
+$WireframePyText = @'
+#!/usr/bin/env python3
+"""Generate a top-down roof wireframe image from an .evm file (a renamed MATLAB .mat file).
+
+Usage:
+    python roof_wireframe.py job.evm
+    python roof_wireframe.py job.evm -o roof.png --no-pitch --dpi 200
+    python roof_wireframe.py job.evm -o overlay.png --overlay O_1234_01.jpg
+    python roof_wireframe.py job.evm -v        # extra (debug) logging
+    python roof_wireframe.py job.evm -q        # warnings/errors only
+
+Progress is logged to the terminal (stdout) with timestamps.
+
+--overlay draws the wireframe on top of the given top-down photo. The model
+units are image pixels (Units == 'pixels', ImageData[0] has a ~identity
+transform), so model x/y are used directly as photo pixel coordinates. If the
+photo was exported at a different resolution than the tool's working image, use
+--scale (e.g. 2 if the photo is twice as large).
+
+Requires: numpy, scipy, matplotlib
+"""
+import argparse
+import logging
+import sys
+import time
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.io as sio
+from matplotlib.path import Path
+
+log = logging.getLogger("roof_wireframe")
+
+# Edge classification comes from each segment's LegacyUserTypeOverride code
+# (same codes as SegmentLabels.Style). Mapping inferred from the file's geometry.
+SEG_NAMES = {0: "Unspecified", 19: "Parapet", 18: "Flashing", 17: "StepFlashing", 16: "Rake",
+             15: "Eave", 14: "Valley", 13: "Ridge", 12: "Hip", 11: "Other",
+             10: "Hidden"}
+SEG_COLORS = {0: "#808080", 19: "#7a0fe3", 18: "#c88c28", 17: "#a06000", 16: "#1a991a",
+              15: "#000000", 14: "#0000ff", 13: "#ff0000", 12: "#ff00ff",
+              11: "#ff99c7", 10: "#ffff00"}
+
+# Dashed vs solid, per edge type
+DASHED = {"StepFlashing", "Rake", "Valley", "Hip"}
+
+def line_style(code):
+    return "--" if SEG_NAMES[code] in DASHED else "-"
+UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn solid gray (kept distinct from "Other", code 11)
+
+# Pitch labels on the plain wireframe: 9 pt is the normal size. A label is only
+# made smaller when it does not fit inside its facet at that size.
+PITCH_FONT_MAX = 9.0        # default size
+PITCH_FONT_MIN = 3.5        # never shrink below this
+PITCH_FONT_STEP = 0.5
+PITCH_BBOX_PAD = 0.15       # boxstyle pad, as a fraction of the font size
+PITCH_FIT_MARGIN_PT = 1.0   # extra breathing room around the label (points)
+PITCH_MAX_CANDIDATES = 30   # centre positions tried per facet
+
+# Overlay look (drawn over the photo). Thin lines so the photo stays readable.
+OVERLAY_LINE_WIDTH = 0.8
+OVERLAY_HALO_WIDTH = 2.0
+OVERLAY_POINT_SIZE = 4
+OVERLAY_POINT_EDGE = 0.3
+
+
+def load_geometry(path):
+    """Return (points Nx3 array, list of (segment_type, [i, j]) with 0-based indices)."""
+    # .evm files are renamed .mat files; open as a file object so the extension doesn't matter
+    log.info("Loading %s", path)
+    t0 = time.perf_counter()
+    with open(path, "rb") as fh:
+        mat = sio.loadmat(fh, struct_as_record=False, squeeze_me=True)
+    if "ThisStructure" not in mat:
+        sys.exit("No 'ThisStructure' variable found in the .evm file.")
+    ts = mat["ThisStructure"]
+    pts = np.array([[p.x, p.y, p.z] for p in np.atleast_1d(ts.Points)], dtype=float)
+    segs = []
+    for s in np.atleast_1d(ts.Segments):
+        idx = np.atleast_1d(s.Contains).astype(int) - 1  # MATLAB is 1-based
+        if len(idx) != 2:
+            segs.append((UNSPECIFIED_CODE, None))  # placeholder keeps facet segment indices aligned
+            continue
+        code = s.LegacyUserTypeOverride
+        code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
+        segs.append((code if code in SEG_NAMES else UNSPECIFIED_CODE, idx))
+    facets = []
+    for f in np.atleast_1d(ts.Facets):
+        seg_ids = np.atleast_1d(f.Contains).astype(int) - 1  # segment indices (1-based in file)
+        pitch = f.Pitch if np.isscalar(f.Pitch) else np.nan
+        facets.append((seg_ids, float(pitch)))
+    n_seg = sum(1 for _, ix in segs if ix is not None)
+    log.info("Loaded %d points, %d segments, %d facets in %.2fs",
+             len(pts), n_seg, len(facets), time.perf_counter() - t0)
+    return pts, segs, facets
+
+
+def facet_polygon(seg_ids, segs_xy):
+    """Chain a facet's segments into an ordered vertex loop (list of point indices)."""
+    edges = [tuple(segs_xy[k]) for k in seg_ids if 0 <= k < len(segs_xy) and len(segs_xy[k]) == 2]
+    if not edges:
+        return []
+    loop = list(edges[0])
+    remaining = edges[1:]
+    while remaining:
+        for e in remaining:
+            if e[0] == loop[-1]:
+                loop.append(e[1]); remaining.remove(e); break
+            if e[1] == loop[-1]:
+                loop.append(e[0]); remaining.remove(e); break
+        else:
+            break  # open/broken chain
+    if len(loop) > 1 and loop[0] == loop[-1]:
+        loop.pop()
+    return loop
+
+
+def label_candidates(poly, n=60, max_candidates=PITCH_MAX_CANDIDATES):
+    """Points inside the polygon, best (furthest from the edges) first.
+
+    Returns an (k, 2) array. The first row is the point furthest from every edge
+    (as far as a coarse grid search finds); the rest are other well-inside points
+    so a wide label can slide along an elongated facet.
+    """
+    path = Path(poly)
+    lo, hi = poly.min(0), poly.max(0)
+    gx, gy = np.meshgrid(np.linspace(lo[0], hi[0], n), np.linspace(lo[1], hi[1], n))
+    grid = np.c_[gx.ravel(), gy.ravel()]
+    grid = grid[path.contains_points(grid)]
+    if len(grid) == 0:
+        return poly.mean(0)[None, :]
+    a, b = poly, np.roll(poly, -1, axis=0)
+    ab = b - a
+    denom = np.maximum((ab ** 2).sum(1), 1e-12)
+    ap = grid[:, None, :] - a[None, :, :]                       # (G, E, 2)
+    t = np.clip((ap * ab[None]).sum(2) / denom[None], 0, 1)     # (G, E)
+    nearest = a[None] + t[..., None] * ab[None]
+    d = np.linalg.norm(grid[:, None, :] - nearest, axis=2).min(1)
+    order = np.argsort(-d)
+    order = order[d[order] >= 0.5 * d[order[0]]]
+    if len(order) > max_candidates:
+        order = order[np.unique(np.r_[0, np.linspace(0, len(order) - 1, max_candidates).astype(int)])]
+    return grid[order]
+
+
+def label_point(poly):
+    """A point inside the polygon, as far from its edges as a coarse grid search finds."""
+    return label_candidates(poly)[0]
+
+
+def box_fits(path, poly, cx, cy, hw, hh, samples=10):
+    """True if the axis-aligned box centred on (cx, cy) lies fully inside the polygon."""
+    xs = np.linspace(cx - hw, cx + hw, samples)
+    ys = np.linspace(cy - hh, cy + hh, samples)
+    ring = np.r_[np.c_[xs, np.full_like(xs, cy - hh)], np.c_[xs, np.full_like(xs, cy + hh)],
+                 np.c_[np.full_like(ys, cx - hw), ys], np.c_[np.full_like(ys, cx + hw), ys]]
+    if not path.contains_points(ring).all():
+        return False
+    # a polygon corner poking into the box means a notch/line would be covered
+    poking = (np.abs(poly[:, 0] - cx) < hw) & (np.abs(poly[:, 1] - cy) < hh)
+    return not poking.any()
+
+
+def fit_pitch_label(poly, text, size_units):
+    """Pick (x, y, fontsize, fitted) for a pitch label.
+
+    Tries the default font size first and only steps down when the label can't be
+    placed fully inside the facet. size_units(text, fontsize) -> (width, height)
+    of the label (including its background box) in data units.
+    """
+    path = Path(poly)
+    cands = label_candidates(poly)
+    sizes = np.arange(PITCH_FONT_MAX, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
+    for fs in sizes:
+        w, h = size_units(text, float(fs))
+        for cx, cy in cands:
+            if box_fits(path, poly, cx, cy, w / 2, h / 2):
+                return float(cx), float(cy), float(fs), True
+    cx, cy = cands[0]
+    return float(cx), float(cy), float(sizes[-1]), False
+
+
+def fmt_pitch(p):
+    p = round(float(p), 1)
+    return f"{p:g}"
+
+
+def draw_pitch_labels(fig, ax, pts, segs, facets):
+    """Draw each facet's pitch at the default size, shrinking only when it won't fit."""
+    renderer = fig.canvas.get_renderer()
+    p0 = ax.transData.transform((0.0, 0.0))
+    p1 = ax.transData.transform((1.0, 0.0))
+    pt_per_unit = abs(p1[0] - p0[0]) * 72.0 / fig.dpi  # points per data unit (aspect is equal)
+    can_fit = bool(np.isfinite(pt_per_unit) and pt_per_unit > 0)
+    if not can_fit:
+        log.warning("Could not work out the drawing scale; pitch labels use the default size")
+
+    cache = {}
+
+    def size_units(text, fs):
+        key = (text, fs)
+        if key not in cache:
+            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold")
+            bb = t.get_window_extent(renderer)
+            t.remove()
+            pad = 2 * PITCH_BBOX_PAD * fs + PITCH_FIT_MARGIN_PT
+            cache[key] = ((bb.width * 72.0 / fig.dpi + pad) / pt_per_unit,
+                          (bb.height * 72.0 / fig.dpi + pad) / pt_per_unit)
+        return cache[key]
+
+    segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
+    drawn = shrunk = tight = skipped = 0
+    for n, (seg_ids, pv) in enumerate(facets, start=1):
+        if not np.isfinite(pv):  # nan or +/-inf pitch: nothing sensible to show
+            skipped += 1
+            continue
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or np.isnan(pts[loop]).any():
+            log.debug("Facet %d: no usable outline, pitch label skipped", n)
+            skipped += 1
+            continue
+        poly = pts[loop][:, :2]
+        text = fmt_pitch(pv)
+        if can_fit:
+            x, y, fs, fitted = fit_pitch_label(poly, text, size_units)
+        else:
+            x, y = label_point(poly)
+            fs, fitted = PITCH_FONT_MAX, True
+        if fs < PITCH_FONT_MAX:
+            shrunk += 1
+            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, PITCH_FONT_MAX, fs)
+        if not fitted:
+            tight += 1
+            log.warning("Facet %d: pitch %s still does not fit at %.1f pt (facet is very small)", n, text, fs)
+        ax.text(x, y, text, ha="center", va="center", fontsize=fs,
+                fontweight="bold", color="#0a4d8c", zorder=4,
+                bbox=dict(boxstyle=f"round,pad={PITCH_BBOX_PAD}", fc="white", ec="none", alpha=0.8))
+        drawn += 1
+    log.info("Pitch labels: %d drawn, %d shrunk, %d too small even at minimum, %d skipped",
+             drawn, shrunk, tight, skipped)
+
+
+def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=150):
+    ok = ~np.isnan(pts).any(axis=1)
+    fig, ax = plt.subplots(figsize=(9, 9), facecolor="white")
+    used = {}
+
+    for stype, ix in segs:
+        if ix is None:
+            continue
+        i, j = ix
+        if not (ok[i] and ok[j]):
+            continue
+        used[stype] = used.get(stype, 0) + 1
+        ax.plot([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]],
+                line_style(stype), color=SEG_COLORS[stype], lw=1.2)
+    log.info("Drew %d segments (%s)", sum(used.values()),
+             ", ".join(f"{SEG_NAMES[c]}={n}" for c, n in sorted(used.items())) or "none")
+
+    ax.scatter(pts[ok, 0], pts[ok, 1], s=10, c="black", zorder=3)
+
+    ax.set_aspect("equal")
+    ax.invert_yaxis()  # image-style coordinates: y grows downward
+    ax.axis("off")  # no axes, ticks, grid or title - just the wireframe
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.03, top=0.97)  # keeps image square
+
+    if pitch:
+        fig.canvas.draw()  # settle limits/aspect so the data -> point scale is known
+        draw_pitch_labels(fig, ax, pts, segs, facets)
+    else:
+        log.info("Pitch labels hidden (--no-pitch)")
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=1400):
+    """Draw the wireframe on top of the top-down photo (model x/y == photo pixels)."""
+    import matplotlib.image as mpimg
+    import matplotlib.patheffects as pe
+
+    img = mpimg.imread(img_path)
+    h, w = img.shape[:2]
+    k = min(1.0, max_px / max(w, h))
+    log.info("Overlay on %s (%dx%d px, output scale %.2f, model scale %.2f)", img_path, w, h, k, scale)
+    dpi = 100
+    fig = plt.figure(figsize=(w * k / dpi, h * k / dpi), dpi=dpi, facecolor="black")
+    ax = fig.add_axes([0, 0, 1, 1])
+    if img.ndim == 2:
+        ax.imshow(img, cmap="gray", extent=(0, w, h, 0), interpolation="bilinear")
+    else:
+        ax.imshow(img, extent=(0, w, h, 0), interpolation="bilinear")
+
+    xy = pts[:, :2] * scale
+    ok = ~np.isnan(xy).any(axis=1)
+    if ok.any():
+        lo, hi = xy[ok].min(0), xy[ok].max(0)
+        if hi[0] > w * 1.02 or hi[1] > h * 1.02 or lo.min() < -0.02 * max(w, h):
+            log.warning("Wireframe extent x %.0f..%.0f, y %.0f..%.0f does not fit the %dx%d photo - try --scale",
+                        lo[0], hi[0], lo[1], hi[1], w, h)
+
+    halo = [pe.Stroke(linewidth=OVERLAY_HALO_WIDTH, foreground="white", alpha=0.85), pe.Normal()]
+    drawn = 0
+    for stype, ix in segs:
+        if ix is None:
+            continue
+        i, j = ix
+        if not (ok[i] and ok[j]):
+            continue
+        ax.plot([xy[i, 0], xy[j, 0]], [xy[i, 1], xy[j, 1]], line_style(stype),
+                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH, path_effects=halo)
+        drawn += 1
+    ax.scatter(xy[ok, 0], xy[ok, 1], s=OVERLAY_POINT_SIZE, c="black", edgecolors="white",
+               linewidths=OVERLAY_POINT_EDGE, zorder=3)
+    log.info("Drew %d segments on the photo (line width %.1f)", drawn, OVERLAY_LINE_WIDTH)
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("evm_file", help="Input .evm file")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Output PNG (default: <evm_file>_topdown.png)")
+    ap.add_argument("--no-pitch", action="store_true", help="Hide per-facet pitch labels")
+    ap.add_argument("--dpi", type=int, default=150)
+    ap.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging")
+    ap.add_argument("-q", "--quiet", action="store_true", help="Only log warnings and errors")
+    ap.add_argument("--overlay", default=None, metavar="IMAGE",
+                    help="Draw the wireframe on top of this top-down photo instead")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Multiply model x/y by this to match the photo's resolution (overlay only)")
+    args = ap.parse_args()
+
+    # Log to stdout (flushed per line) so the lines stay in order with the final
+    # "Saved ..." message when a parent process captures the output.
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s", "%H:%M:%S"))
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
+                        handlers=[handler])
+
+    out = args.output or args.evm_file.rsplit(".", 1)[0] + "_topdown.png"
+    mode = "overlay" if args.overlay else "wireframe"
+    log.info("Rendering %s for %s -> %s", mode, args.evm_file, out)
+    t0 = time.perf_counter()
+    try:
+        pts, segs, facets = load_geometry(args.evm_file)
+        if args.overlay:
+            plot_overlay(pts, segs, args.overlay, out, scale=args.scale)
+        else:
+            plot_top_down(pts, segs, facets, out,
+                          pitch=not args.no_pitch, dpi=args.dpi)
+    except Exception:
+        log.exception("Failed to render %s", mode)
+        sys.exit(1)
+    log.info("Finished %s in %.2fs", mode, time.perf_counter() - t0)
+    print(f"Saved {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+'@
+# Prefer the copy on the PIA share (so it can be updated without redeploying
+# PAR); if there isn't one, write the copy embedded in this file to the cache.
+$WireframeScriptLocal = Get-PiaScriptLocal -FileName 'roof_wireframe.py'
+if (-not $WireframeScriptLocal) {
+    try {
+        $embDir = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
+        New-Item -ItemType Directory -Force -Path $embDir | Out-Null
+        $embPath = Join-Path $embDir 'roof_wireframe.embedded.py'
+        [System.IO.File]::WriteAllText($embPath, $WireframePyText, (New-Object System.Text.UTF8Encoding($false)))
+        $WireframeScriptLocal = $embPath
+    }
+    catch { }
+}
+if ($WireframeScriptLocal) { Write-ParLog "wireframe script: $WireframeScriptLocal" 'INFO' 'startup' }
+else { Write-ParLog 'roof_wireframe.py not available - Wireframe/Overlay tiles will show an error' 'WARN' 'startup' }
 # fileinfo.exe writes its own intermediate file to a FIXED path in the
 # user's Temp folder while it parses (not something we control — it's
 # internal to the tool). With the request pool running several requests at
@@ -4055,7 +4882,10 @@ foreach ($varDef in @(
     @{ Name = 'InProgressRoots'  ; Value = $InProgressRoots }
     @{ Name = 'FolderCache'      ; Value = $FolderCache }
     @{ Name = 'FileInfoExeLocal' ; Value = $FileInfoExeLocal }
+    @{ Name = 'PythonExeLocal'   ; Value = $PythonExeLocal }
+    @{ Name = 'WireframeScriptLocal' ; Value = $WireframeScriptLocal }
     @{ Name = 'FileInfoExeLock'  ; Value = $FileInfoExeLock }
+    @{ Name = 'ParLogEnabled'    ; Value = $ParLogEnabled }
 )) {
     $entry = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry(
         $varDef.Name, $varDef.Value, $null)
@@ -4073,7 +4903,42 @@ $requestScript = {
     $ImageExtensions  = @('.jpg', '.jpeg')
     $ArchiveRootsFull = $ArchiveRoots.Values | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
 
+    # Same logger as the main script (pooled runspaces don't share functions).
+    function Write-ParLog {
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Message,
+            [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO',
+            [Parameter(Position = 2)][string]$Source = 'http'
+        )
+        if (-not $ParLogEnabled) { return }
+        try {
+            $color = switch ($Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'DEBUG' { 'DarkGray' } default { 'Cyan' } }
+            Write-Host ("[{0}] [{1,-5}] [{2}] {3}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Level, $Source, $Message) -ForegroundColor $color
+        }
+        catch { }
+    }
+
+    # Short, readable description of a request for the log (file names, not raw UNC paths).
+    function Get-RequestDescription($ctx) {
+        $p = $ctx.Request.Url.AbsolutePath
+        $q = $ctx.Request.QueryString
+        switch ($p) {
+            '/api/images'     { return "images: report=$($q['reportId']) location=$($q['location'])$(if ($q['folderName']) { ' folder=' + $q['folderName'] })" }
+            '/api/file-info'  { return "file-info: report=$($q['reportId']) state=$($q['state']) source=$($q['source'])" }
+            '/api/wireframe'  { $mode = if ($q['overlay'] -eq '1') { 'overlay' } else { 'wireframe' }; return "wireframe ($mode): $((("$($q['evm'])") -split '[\\/]')[-1])" }
+            '/api/image-file' { return "image-file: $((("$($q['path'])") -split '[\\/]')[-1])" }
+            default           { return "$($ctx.Request.HttpMethod) $p" }
+        }
+    }
+
     function Write-JsonResponse($ctx, $obj, [int]$statusCode = 200) {
+        try {
+            if ($statusCode -ge 400 -or (($obj -is [System.Collections.IDictionary]) -and $obj.Contains('found') -and -not $obj['found'])) {
+                $why = if ($obj['error']) { $obj['error'] } elseif ($obj['message']) { $obj['message'] } else { '(no detail)' }
+                Write-ParLog "$why" 'WARN' 'http'
+            }
+        }
+        catch { }
         $json  = $obj | ConvertTo-Json -Compress -Depth 6
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $ctx.Response.StatusCode     = $statusCode
@@ -4206,21 +5071,42 @@ $requestScript = {
         }
         $imagesDir = Join-Path $folder.FullName 'Images'
         $imageUrls = @()
+        $imageLabels = @()
+        $topDownUrl = $null
+        Write-ParLog "report $reportId -> folder '$($folder.Name)' (found by $searchMethod)" 'INFO' 'images'
         if (Test-Path -LiteralPath $imagesDir) {
             try {
                 # Direction order for elevation shots: Overview, North, East, West, South.
                 $ElevationOrder = @{ 'O' = 0; 'N' = 1; 'E' = 2; 'W' = 3; 'S' = 4 }
-                $files = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction Stop |
-                         Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() } |
+                $allImages = @(Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction Stop |
+                         Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() })
+                # The top-down overview shot is named O_****_**.jpg. Pick the
+                # newest one explicitly (so it can't be pushed out by newer
+                # elevation shots) and show it first, then up to 4 others.
+                $topDownFile = $allImages |
+                         Where-Object { $_.Name -match '^O_[^_]+_[^_]+\.jpe?g$' } |
                          Sort-Object LastWriteTime -Descending |
-                         Select-Object -First 5 |
+                         Select-Object -First 1
+                $otherFiles = @($allImages |
+                         Where-Object { $_.Name -notmatch '^O_[^_]+_[^_]+\.jpe?g$' } |
+                         Sort-Object LastWriteTime -Descending |
+                         Select-Object -First $(if ($topDownFile) { 4 } else { 5 }) |
                          Sort-Object @{ Expression = {
                              $prefix = $_.BaseName.Substring(0,1).ToUpperInvariant()
                              if ($ElevationOrder.ContainsKey($prefix)) { $ElevationOrder[$prefix] } else { 99 }
-                         } }
+                         } })
+                $files = @(@($topDownFile) + $otherFiles | Where-Object { $_ })
                 $imageUrls = @($files | ForEach-Object { '/api/image-file?path=' + [Uri]::EscapeDataString($_.FullName) })
+                if ($topDownFile) { $topDownUrl = '/api/image-file?path=' + [Uri]::EscapeDataString($topDownFile.FullName) }
+                # Label for each photo, same order as $imageUrls: O_ = Ortho (top-down), N/E/W/S = elevations.
+                $ElevationLabels = @{ 'O' = 'Ortho (top)'; 'N' = 'North'; 'E' = 'East'; 'W' = 'West'; 'S' = 'South' }
+                $imageLabels = @($files | ForEach-Object {
+                    $lead = if ($_.BaseName) { $_.BaseName.Substring(0, 1).ToUpperInvariant() } else { '' }
+                    if ($ElevationLabels.ContainsKey($lead)) { $ElevationLabels[$lead] } else { '' }
+                })
+                Write-ParLog ("{0} image(s): {1}" -f $files.Count, ((@($files | ForEach-Object { $_.Name })) -join ', ')) 'INFO' 'images'
             }
-            catch { }
+            catch { Write-ParLog "couldn't list $imagesDir : $($_.Exception.Message)" 'WARN' 'images' }
         }
         Write-JsonResponse $ctx @{
             found       = $true
@@ -4232,6 +5118,8 @@ $requestScript = {
             matchCount  = 1
             imageCount  = $imageUrls.Count
             images      = $imageUrls
+            imageLabels = $imageLabels
+            topDown     = $topDownUrl
         }
     }
 
@@ -4270,6 +5158,122 @@ $requestScript = {
         catch {
             $ctx.Response.StatusCode = 404
         }
+    }
+
+    function Handle-Wireframe($ctx) {
+        # Renders a PNG from the given .evm via roof_wireframe.py:
+        #   (default)     plain top-down wireframe
+        #   overlay=1     wireframe drawn on the report's top-down photo
+        #                 (Images\O_****_**.jpg next to the Rollback folder)
+        # Only .evm files under the known archive roots are accepted (same
+        # allow-list as Handle-ImageFile). Results are cached per file version.
+        $reqPath = $ctx.Request.QueryString['evm']
+        $overlay = ($ctx.Request.QueryString['overlay'] -eq '1')
+        if ([string]::IsNullOrWhiteSpace($reqPath)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Missing evm path' } 400
+            return
+        }
+        try { $full = [System.IO.Path]::GetFullPath($reqPath) }
+        catch { Write-JsonResponse $ctx @{ found = $false; error = 'Invalid evm path' } 400; return }
+        $withinKnownRoot = $false
+        foreach ($root in $ArchiveRootsFull) {
+            if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $withinKnownRoot = $true; break }
+        }
+        if (-not $withinKnownRoot -or [System.IO.Path]::GetExtension($full).ToLowerInvariant() -ne '.evm') {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Path not allowed' } 403
+            return
+        }
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'EVM file not found' } 404
+            return
+        }
+        if (-not $WireframeScriptLocal -or -not (Test-Path -LiteralPath $WireframeScriptLocal -PathType Leaf)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'roof_wireframe.py not found (put it next to fileinfo.py on the PIA share)' } 500
+            return
+        }
+        if (-not $PythonExeLocal) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Python 3 not found (needs numpy, scipy, matplotlib)' } 500
+            return
+        }
+        $topDownFile = $null
+        if ($overlay) {
+            # <archive folder>\Rollback\<n>.0.evm  ->  <archive folder>\Images\O_****_**.jpg
+            $folderDir = Split-Path -Path (Split-Path -Path $full -Parent) -Parent
+            $imagesDir = Join-Path $folderDir 'Images'
+            if (Test-Path -LiteralPath $imagesDir) {
+                $topDownFile = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^O_[^_]+_[^_]+\.jpe?g$' } |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1
+            }
+            if (-not $topDownFile) {
+                Write-JsonResponse $ctx @{ found = $false; code = 'no-topdown'; error = 'No top-down image (O_****_**.jpg) found' } 404
+                return
+            }
+        }
+        $ticks = (Get-Item -LiteralPath $full).LastWriteTimeUtc.Ticks
+        $wfKey = if ($overlay) { "wfo:$full|$ticks|$($topDownFile.FullName)|$($topDownFile.LastWriteTimeUtc.Ticks)" } else { "wf:$full|$ticks" }
+        $png = $null
+        $cachedPng = $null
+        if ($FolderCache.TryGetValue($wfKey, [ref]$cachedPng) -and $cachedPng -is [byte[]]) {
+            Write-ParLog ("served from cache ({0:N0} KB)" -f ($cachedPng.Length / 1KB)) 'DEBUG' 'wireframe'
+            $png = $cachedPng
+        }
+        else {
+            $id       = [guid]::NewGuid().ToString('N')
+            $localEvm = Join-Path $env:TEMP "parwf_$id.evm"
+            $localImg = Join-Path $env:TEMP "parwf_$id.jpg"
+            $outPng   = Join-Path $env:TEMP "parwf_$id.png"
+            try {
+                Copy-Item -LiteralPath $full -Destination $localEvm -Force
+                $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--dpi', '110')
+                if ($overlay) {
+                    Copy-Item -LiteralPath $topDownFile.FullName -Destination $localImg -Force
+                    $pyArgs += @('--overlay', $localImg)
+                }
+                $wfSw = [System.Diagnostics.Stopwatch]::StartNew()
+                Write-ParLog ("running {0} ({1})" -f [System.IO.Path]::GetFileName($WireframeScriptLocal), $(if ($overlay) { 'overlay on ' + $topDownFile.Name } else { 'plain wireframe' })) 'DEBUG' 'wireframe'
+                $log = & $PythonExeLocal @pyArgs 2>&1 | Out-String
+                foreach ($pyLine in ($log -split "\r?\n")) {
+                    if (-not $pyLine.Trim()) { continue }
+                    $pyLevel = if ($pyLine -match '\b(ERROR|CRITICAL|Traceback)\b') { 'ERROR' } elseif ($pyLine -match '\bWARNING\b') { 'WARN' } else { 'DEBUG' }
+                    Write-ParLog $pyLine.TrimEnd() $pyLevel 'wireframe/py'
+                }
+                if (-not (Test-Path -LiteralPath $outPng -PathType Leaf) -and $log -match "No module named '?matplotlib") {
+                    # matplotlib missing: try a per-user pip install once per PAR session, then retry.
+                    [System.Threading.Monitor]::Enter($FolderCache)
+                    try {
+                        if (-not $FolderCache.ContainsKey('mpl-install-tried')) {
+                            $FolderCache['mpl-install-tried'] = $true
+                            $null = & $PythonExeLocal -m pip install --user --disable-pip-version-check matplotlib 2>&1 | Out-String
+                        }
+                    }
+                    finally { [System.Threading.Monitor]::Exit($FolderCache) }
+                    $log = & $PythonExeLocal @pyArgs 2>&1 | Out-String
+                }
+                if (-not (Test-Path -LiteralPath $outPng -PathType Leaf)) {
+                    $lines  = @(($log -split "\r?\n") | Where-Object { $_.Trim() })
+                    $last   = if ($lines.Count) { $lines[-1].Trim() } else { 'no output from python' }
+                    $detail = $log.Trim()
+                    if ($detail.Length -gt 600) { $detail = $detail.Substring($detail.Length - 600) }
+                    Write-JsonResponse $ctx @{ found = $false; error = $last; detail = $detail } 500
+                    return
+                }
+                $png = [System.IO.File]::ReadAllBytes($outPng)
+                Write-ParLog ("rendered {0:N0} KB in {1} ms" -f ($png.Length / 1KB), $wfSw.ElapsedMilliseconds) 'OK' 'wireframe'
+            }
+            catch {
+                Write-JsonResponse $ctx @{ found = $false; error = "wireframe failed: $($_.Exception.Message)" } 500
+                return
+            }
+            finally {
+                Remove-Item -LiteralPath $localEvm, $localImg, $outPng -Force -ErrorAction SilentlyContinue
+            }
+            $FolderCache[$wfKey] = $png
+        }
+        $ctx.Response.ContentType     = 'image/png'
+        $ctx.Response.ContentLength64 = $png.Length
+        $ctx.Response.OutputStream.Write($png, 0, $png.Length)
     }
 
     function Handle-FileInfo($ctx) {
@@ -4365,6 +5369,7 @@ $requestScript = {
             return
         }
         $evmFile = $evmFiles[0].FullName
+        Write-ParLog "report $reportId -> $($folder.Name)\Rollback\$($evmFiles[0].Name)" 'INFO' 'file-info'
 
         # --- Output cache: if this exact .evm version has already been
         # parsed (by this request or a concurrent sibling one), skip
@@ -4380,6 +5385,7 @@ $requestScript = {
         $outputCacheKey = "out:$evmFile|$($evmWriteTime.Ticks)"
         $cachedEntry = $null
         if ($FolderCache.TryGetValue($outputCacheKey, [ref]$cachedEntry)) {
+            Write-ParLog "served from cache (rollback $rollbackVersion)" 'DEBUG' 'file-info'
             Write-JsonResponse $ctx @{
                 found      = $true
                 reportId   = $reportId
@@ -4403,6 +5409,10 @@ $requestScript = {
             Write-JsonResponse $ctx @{ found = $false; error = 'fileinfo tool not available (local cache empty and share unreachable)' } 500
             return
         }
+        if (-not $PythonExeLocal) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Python 3 not found on this machine. Install it (python.org, tick Add to PATH) then run: pip install scipy numpy' } 500
+            return
+        }
 
         # Copy the .evm locally before handing it to fileinfo.exe, rather
         # than pointing the tool at the UNC path directly — if the tool
@@ -4420,7 +5430,7 @@ $requestScript = {
             # $FileInfoExeLock's comment above for why.
             $FileInfoExeLock.Wait()
             $lockAcquired = $true
-            $output = & $fileInfoExe $localEvm 2>&1 | Out-String
+            $output = & $PythonExeLocal $fileInfoExe $localEvm 2>&1 | Out-String
             $execMs = $sw.ElapsedMilliseconds
         }
         catch {
@@ -4433,6 +5443,8 @@ $requestScript = {
         }
         $output = $output.Trim()
         $FolderCache[$outputCacheKey] = $output
+        if ($output -match '"status":\s*"ERROR"') { Write-ParLog "fileinfo reported an error: $output" 'WARN' 'file-info' }
+        else { Write-ParLog "parsed rollback $rollbackVersion (copy $copyMs ms, python $execMs ms)" 'OK' 'file-info' }
         Write-JsonResponse $ctx @{
             found      = $true
             reportId   = $reportId
@@ -4445,6 +5457,8 @@ $requestScript = {
         }
     }
 
+    $reqSw   = [System.Diagnostics.Stopwatch]::StartNew()
+    $logPath = $ctx.Request.Url.AbsolutePath
     try {
         $path = $ctx.Request.Url.AbsolutePath
         if ($path -eq '/api/images') {
@@ -4455,6 +5469,9 @@ $requestScript = {
         }
         elseif ($path -eq '/api/file-info') {
             Handle-FileInfo $ctx
+        }
+        elseif ($path -eq '/api/wireframe') {
+            Handle-Wireframe $ctx
         }
         elseif ($Assets.ContainsKey($path)) {
             $item  = $Assets[$path]
@@ -4467,8 +5484,18 @@ $requestScript = {
             $ctx.Response.StatusCode = 404
         }
     }
-    catch { }
-    finally { $ctx.Response.OutputStream.Close() }
+    catch { Write-ParLog "unhandled error for $logPath : $($_.Exception.Message)" 'ERROR' 'http' }
+    finally {
+        try {
+            if ($logPath -like '/api/*') {
+                $status = $ctx.Response.StatusCode
+                $lvl = if ($status -ge 500) { 'ERROR' } elseif ($status -ge 400) { 'WARN' } else { 'INFO' }
+                Write-ParLog ("{0} -> {1} ({2} ms)" -f (Get-RequestDescription $ctx), $status, $reqSw.ElapsedMilliseconds) $lvl 'http'
+            }
+        }
+        catch { }
+        $ctx.Response.OutputStream.Close()
+    }
 }
 # Background runspace whose only job is accepting connections and immediately
 # handing each one to the pool. Because Accept() itself is the only thing
@@ -4531,6 +5558,7 @@ $window.Add_Activated({
     try { $webView.Focus() | Out-Null } catch { }
 })
 $window.Add_Closed({
+    Write-ParLog 'Window closed - shutting down the local server' 'INFO' 'PAR'
     try { $listener.Stop() } catch { }
     try { $serverPs.Stop(); $serverPs.Dispose() } catch { }
     try { $listenerRunspace.Close() } catch { }
@@ -4544,6 +5572,7 @@ try {
     $coreEnv = $envTask.GetAwaiter().GetResult()
 }
 catch {
+    Write-ParLog "Couldn't create the WebView2 environment: $($_.Exception.Message)" 'ERROR' 'webview2'
     [System.Windows.MessageBox]::Show(
         "Couldn't create the WebView2 environment`n`n$($_.Exception.Message)`n`n" +
         "Make sure the Microsoft Edge WebView2 Runtime is installed " +
@@ -4555,6 +5584,7 @@ catch {
 $webView.add_CoreWebView2InitializationCompleted({
     param($eventSender, $e)
     if ($e.IsSuccess) {
+        Write-ParLog "WebView2 ready - opening $prefix" 'OK' 'webview2'
         # Disable WebView2's own browser-style right-click menu (Reload,
         # Back, View Source, etc.). The page has its own custom row context
         # menu with a JS-level e.preventDefault(), but that only covers the
@@ -4570,10 +5600,25 @@ $webView.add_CoreWebView2InitializationCompleted({
         $webView.CoreWebView2.add_NewWindowRequested({
             param($wvSender, $wvArgs)
             $wvArgs.Handled = $true
+            Write-ParLog "opening in default browser: $($wvArgs.Uri)" 'INFO' 'webview2'
             try { Start-Process $wvArgs.Uri } catch { }
+        })
+        # Page -> terminal log bridge: the page calls parLog()/console.error()/console.warn(),
+        # which post {level,message} here so UI actions and JS errors show up in this window.
+        $webView.CoreWebView2.add_WebMessageReceived({
+            param($wmSender, $wmArgs)
+            try {
+                $raw = $wmArgs.TryGetWebMessageAsString()
+                if (-not $raw) { return }
+                $m = $raw | ConvertFrom-Json
+                $lvl = switch ("$($m.level)") { 'error' { 'ERROR' } 'warn' { 'WARN' } 'ok' { 'OK' } default { 'INFO' } }
+                Write-ParLog "$($m.message)" $lvl 'page'
+            }
+            catch { }
         })
     }
     else {
+        Write-ParLog "WebView2 failed to initialize: $($e.InitializationException.Message)" 'ERROR' 'webview2'
         [System.Windows.MessageBox]::Show(
             "WebView2 failed to initialize`n`n$($e.InitializationException.Message)",
             'PAR — startup failed', 'OK', 'Error') | Out-Null
