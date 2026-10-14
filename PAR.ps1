@@ -5,6 +5,7 @@ PAR — Prod Active Reports (standalone desktop GUI)
 Created and developed by PIA — members: Pogi, LT, Rona
 
 Do not edit the code without informing PIA
+PIA site: https://eagleviewcloud.sharepoint.com/sites/QualityTeam/SitePages/PIA.aspx
 ============================================================================
 #>
 
@@ -22,7 +23,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 #  SHORTCUT SELF-DEPLOY
 # ============================================================
 $Desktop = [Environment]::GetFolderPath("Desktop")
-Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR.lnk" `
+Copy-Item -Path "P:\1_Coordinators\PIA\PAR.lnk" `
           -Destination "$Desktop\PAR.lnk" `
           -Force -ErrorAction SilentlyContinue
 
@@ -33,7 +34,7 @@ Copy-Item -Path "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\
 # using PAR and when. Never throws — a log failure must not block the app.
 function Write-ParUsageLog {
     param(
-        [string]$LogPath = "\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\PAR\Logs\PAR_usage.csv",
+        [string]$LogPath = "P:\1_Coordinators\PIA\PAR\Logs\PAR_usage.csv",
         [string]$Action  = 'Launch',
         [string]$Details = ''
     )
@@ -113,63 +114,56 @@ function Get-ParErrorResponseBody {
     return $null
 }
 
-# Some accounts are registered with the "mnl" subdomain segment and some
-# without (james.pogio@mnl.eagleview.com <-> james.pogio@eagleview.com).
-# Toggles whichever form isn't currently in use so either direction works.
-function Get-ParAltEmail {
+# Accounts may be registered under any of these email domains depending on
+# site (PH main, PH "mnl" segment, or Bogotá). Build the candidate list from
+# the local part of the UPN and try each domain in turn until one resolves
+# to a real user.
+function Get-ParCandidateEmails {
     param([string]$Email)
-    if ($Email -match '@mnl\.') {
-        return $Email -replace '@mnl\.', '@'
-    }
-    else {
-        return $Email -replace '@', '@mnl.'
-    }
+    $localPart = ($Email -split '@')[0]
+    return @(
+        "$localPart@eagleview.com",
+        "$localPart@mnl.eagleview.com",
+        "$localPart@bog.eagleview.net"
+    )
 }
 
-# Some accounts are registered with the "mnl" subdomain segment and some
-# without. If the API can't find the user (404 / "No user found"), retry
-# once with the alternate email form (mnl. added or stripped).
-try {
-    $userRoleResponse = Get-ParUserRoleResponse -Email $userEmail
-    Write-ParDebug "[DEBUG] userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
-    Write-ParUsageLog -Action 'RoleCheckLookup' -Details "email=$userEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+$candidateEmails = Get-ParCandidateEmails -Email $userEmail
+Write-ParDebug "[DEBUG] candidateEmails = $($candidateEmails -join ', ')" -Color Cyan
 
-    if ($userRoleResponse.message -and $userRoleResponse.message -match 'No user found') {
-        Write-ParDebug "[DEBUG] Initial lookup returned 'No user found' -> trying alt email" -Color Yellow
-        $fallbackEmail = Get-ParAltEmail -Email $userEmail
-        if ($fallbackEmail -ne $userEmail) {
-            Write-ParDebug "[DEBUG] fallbackEmail = $fallbackEmail" -Color Cyan
-            Write-ParUsageLog -Action 'RoleCheckFallback' -Details "original=$userEmail; fallback=$fallbackEmail"
-            $userRoleResponse = Get-ParUserRoleResponse -Email $fallbackEmail
-            Write-ParDebug "[DEBUG] fallback userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
-            Write-ParUsageLog -Action 'RoleCheckFallbackLookup' -Details "email=$fallbackEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
+$userRoleResponse = $null
+$lastLookupError  = $null
+foreach ($candidateEmail in $candidateEmails) {
+    try {
+        $response = Get-ParUserRoleResponse -Email $candidateEmail
+        Write-ParDebug "[DEBUG] userRoleResponse ($candidateEmail) = $($response | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
+        Write-ParUsageLog -Action 'RoleCheckLookup' -Details "email=$candidateEmail; response=$($response | ConvertTo-Json -Compress -Depth 3)"
+
+        if ($response.message -and $response.message -match 'No user found') {
+            Write-ParDebug "[DEBUG] '$candidateEmail' -> No user found, trying next candidate" -Color Yellow
+            continue
+        }
+
+        $userRoleResponse = $response
+        $userEmail        = $candidateEmail
+        break
+    }
+    catch {
+        $lastLookupError = $_
+        $errorBody = Get-ParErrorResponseBody -ErrorRecord $_
+        Write-ParDebug "[DEBUG] EXCEPTION during UserRoleLookup ($candidateEmail): $($_.Exception.Message)" -Color Red
+        Write-ParDebug "[DEBUG] error response body = $errorBody" -Color Red
+
+        $isNotFound = ($_.Exception.Message -match '404') -or ($errorBody -match 'No user found')
+        if ($isNotFound) {
+            Write-ParUsageLog -Action 'RoleCheckFallback' -Details "email=$candidateEmail; triggerError=$($_.Exception.Message)"
+            continue
         }
         else {
-            Write-ParDebug "[DEBUG] No alternate email form available -> no fallback attempted" -Color Yellow
-        }
-    }
-}
-catch {
-    $errorBody = Get-ParErrorResponseBody -ErrorRecord $_
-    Write-ParDebug "[DEBUG] EXCEPTION during UserRoleLookup: $($_.Exception.Message)" -Color Red
-    Write-ParDebug "[DEBUG] error response body = $errorBody" -Color Red
-
-    $fallbackEmail = Get-ParAltEmail -Email $userEmail
-    $shouldFallback = ($fallbackEmail -ne $userEmail) -and
-        (($_.Exception.Message -match '404') -or ($errorBody -match 'No user found'))
-
-    if ($shouldFallback) {
-        Write-ParDebug "[DEBUG] Lookup failed (404 / No user found) -> trying alt email" -Color Yellow
-        Write-ParDebug "[DEBUG] fallbackEmail = $fallbackEmail" -Color Cyan
-        Write-ParUsageLog -Action 'RoleCheckFallback' -Details "original=$userEmail; fallback=$fallbackEmail; triggerError=$($_.Exception.Message)"
-        try {
-            $userRoleResponse = Get-ParUserRoleResponse -Email $fallbackEmail
-            Write-ParDebug "[DEBUG] fallback userRoleResponse = $($userRoleResponse | ConvertTo-Json -Compress -Depth 3)" -Color Cyan
-            Write-ParUsageLog -Action 'RoleCheckFallbackLookup' -Details "email=$fallbackEmail; response=$($userRoleResponse | ConvertTo-Json -Compress -Depth 3)"
-        }
-        catch {
-            Write-ParDebug "[DEBUG] EXCEPTION during fallback UserRoleLookup: $($_.Exception.Message)" -Color Red
-            Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=UserRoleLookupFallback; email=$fallbackEmail; error=$($_.Exception.Message)"
+            # A non-404 failure (network, auth, server error) isn't something
+            # trying another domain will fix — surface it immediately instead
+            # of burning through the remaining candidates.
+            Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=UserRoleLookup; email=$candidateEmail; error=$($_.Exception.Message)"
             [System.Windows.MessageBox]::Show(
                 "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
                 "Please check your network connection and try again, or contact PIA if this continues.",
@@ -177,14 +171,16 @@ catch {
             exit 1
         }
     }
-    else {
-        Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=UserRoleLookup; email=$userEmail; error=$($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Couldn't verify your access permissions.`n`n$($_.Exception.Message)`n`n" +
-            "Please check your network connection and try again, or contact PIA if this continues.",
-            'PAR — access check failed', 'OK', 'Error') | Out-Null
-        exit 1
-    }
+}
+
+if (-not $userRoleResponse) {
+    Write-ParDebug "[DEBUG] FAIL: no candidate email resolved to a user" -Color Red
+    Write-ParUsageLog -Action 'RoleCheckFailed' -Details "stage=NoCandidateMatched; tried=$($candidateEmails -join ','); lastError=$($lastLookupError.Exception.Message)"
+    [System.Windows.MessageBox]::Show(
+        "Couldn't verify your access permissions.`n`nNo matching user was found.`n`n" +
+        "Please contact PIA if this continues.",
+        'PAR — access check failed', 'OK', 'Error') | Out-Null
+    exit 1
 }
 
 $userId = $userRoleResponse.userId
@@ -366,7 +362,8 @@ PIA members: Pogi, LT, Rona
         </div>
       </div>
       <div class="par-stats">
-        <span class="stat-pill live" id="m-statLive">Live: —</span>
+        <span class="stat-pill live" id="m-statRTM" title="Filter by Ready To Measure">RTM: —</span>
+        <span class="stat-pill orange" id="m-statBM" title="Filter by Being Measured">BM: —</span>
         <span class="stat-pill late" id="m-statLate">Due: —</span>
       </div>
     </header>
@@ -388,6 +385,7 @@ PIA members: Pogi, LT, Rona
       <div class="ctrl-divider"></div>
       <span class="ctrl-label">Columns</span>
       <div class="col-controls" id="m-columnControls"></div>
+      <button class="export-csv-btn" id="m-exportCsv" type="button" title="Export visible columns to CSV">⬇ Export</button>
     </div>
     <div class="table-round">
       <table class="par-table sortable" id="measure-table">
@@ -447,7 +445,8 @@ PIA members: Pogi, LT, Rona
         </div>
       </div>
       <div class="par-stats">
-        <span class="stat-pill live" id="q-statLive">Live: —</span>
+        <span class="stat-pill live" id="q-statRFQC" title="Filter by Ready For QC">RFQC: —</span>
+        <span class="stat-pill orange" id="q-statBQC" title="Filter by Being Qced">BQC: —</span>
         <span class="stat-pill late" id="q-statLate">Due: —</span>
       </div>
     </header>
@@ -469,6 +468,7 @@ PIA members: Pogi, LT, Rona
       <div class="ctrl-divider"></div>
       <span class="ctrl-label">Columns</span>
       <div class="col-controls" id="q-columnControls"></div>
+      <button class="export-csv-btn" id="q-exportCsv" type="button" title="Export visible columns to CSV">⬇ Export</button>
     </div>
     <div class="table-round">
       <table class="par-table sortable" id="qc-table">
@@ -494,7 +494,7 @@ PIA members: Pogi, LT, Rona
   <div id="reloadTimerContainer">
     <div class="footer-left">
       <span class="footer-star">★</span>
-      <span class="footer-brand">PIA</span>
+      <span class="footer-brand" id="footerBrandPia" title="Open PIA site">PIA</span>
     </div>
     <div class="footer-center">
       <label style="display:flex;align-items:center;gap:5px;cursor:pointer;">
@@ -505,7 +505,7 @@ PIA members: Pogi, LT, Rona
       <div id="reloadTimer">Loading…</div>
     </div>
     <div class="footer-right">
-      <span class="footer-version">version 3.8.13</span>
+      <span class="footer-version">version 3.9.2</span>
     </div>
   </div>
   <script src="src/PAR.js"></script>
@@ -697,13 +697,31 @@ body.light .par-header { box-shadow: 0 2px 8px rgba(0,0,0,0.07) !important; }
   border-color: var(--green-dim); color: var(--green);
   box-shadow: 0 0 10px rgba(4,170,109,0.3), 0 1px 3px rgba(0,0,0,0.2) !important;
 }
+.stat-pill.orange {
+  border-color: #a85a1e; color: var(--orange);
+  box-shadow: 0 0 10px rgba(255,140,66,0.3), 0 1px 3px rgba(0,0,0,0.2) !important;
+}
 .stat-pill.late {
   border-color: #7a2233; color: var(--red);
   box-shadow: 0 0 10px rgba(255,77,106,0.3), 0 1px 3px rgba(0,0,0,0.2) !important;
 }
 body.light .stat-pill { box-shadow: 0 1px 3px rgba(0,0,0,0.1) !important; }
 body.light .stat-pill.live { box-shadow: 0 0 10px rgba(2,150,89,0.2), 0 1px 3px rgba(0,0,0,0.08) !important; }
+body.light .stat-pill.orange { box-shadow: 0 0 10px rgba(255,140,66,0.25), 0 1px 3px rgba(0,0,0,0.08) !important; }
 body.light .stat-pill.late { box-shadow: 0 0 10px rgba(217,48,80,0.2), 0 1px 3px rgba(0,0,0,0.08) !important; }
+/* Clickable pills — RTM/BM (Measure) and RFQC/BQC (QC) filter the search
+   box by that state; the Due pill stays non-interactive. */
+#m-statRTM, #m-statBM, #q-statRFQC, #q-statBQC {
+  cursor: pointer;
+}
+#m-statRTM:hover, #m-statBM:hover, #q-statRFQC:hover, #q-statBQC:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.15);
+}
+.stat-pill-filter-active {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}
 /* ── CONTROLS BAR ── */
 .controls-bar {
   background: var(--bg-surface);
@@ -770,6 +788,22 @@ body.light .toggle-btn.active-loc {
   color:        #2b7bc8;
   box-shadow: 0 0 8px rgba(43,123,200,0.2), inset 0 1px 0 rgba(43,123,200,0.12) !important;
 }
+/* ── EXPORT CSV BUTTON ── */
+.export-csv-btn {
+  margin-left: auto;
+  font-family: var(--sans); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.03em; white-space: nowrap;
+  padding: 5px 10px; border-radius: 5px;
+  border: 1px solid var(--border-light); background: var(--bg-card);
+  color: var(--text-secondary); cursor: pointer;
+  transition: all 0.15s !important;
+}
+.export-csv-btn:hover {
+  border-color: var(--green); color: var(--text-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+}
+.export-csv-btn:active { transform: translateY(0); }
 /* ── COLUMN CHIPS ── */
 .col-controls { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
 .col-chip {
@@ -914,6 +948,33 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 }
 .detail-footer-btn:active:not(:disabled) { transform: translateY(0); }
 .detail-footer-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+/* Row right-click context menu */
+.row-context-menu {
+  position: fixed;
+  min-width: 180px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 2px 8px rgba(0,0,0,0.3);
+  z-index: 100000;
+  padding: 5px;
+  opacity: 0;
+  transform: scale(0.97);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.row-context-menu.row-context-menu-open { opacity: 1; transform: scale(1); pointer-events: all; }
+body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.08); }
+.row-context-menu-item {
+  display: block; width: 100%; text-align: left;
+  font-family: var(--sans); font-size: 12px; font-weight: 500;
+  color: var(--text-primary); background: transparent;
+  border: none; border-radius: 5px; padding: 7px 10px;
+  cursor: pointer; transition: background 0.1s;
+}
+.row-context-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
+.row-context-menu-item:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.5; }
+.row-context-menu-sep { height: 1px; margin: 5px 2px; background: var(--border); }
 .detail-section { margin-top: 16px; }
 .detail-section:first-child { margin-top: 12px; }
 .detail-section-divider { border: none; border-top: 1px solid var(--border-light); margin: 18px 0 0; }
@@ -1124,6 +1185,11 @@ body.light #themeToggle:hover { box-shadow: 0 3px 8px rgba(0,0,0,0.12), inset 0 
   text-transform: uppercase;
   color: var(--text-secondary);
   font-size: 10px;
+  cursor: pointer;
+}
+.footer-brand:hover {
+  color: var(--amber);
+  text-decoration: underline;
 }
 .footer-version {
   font-family: var(--mono);
@@ -1778,6 +1844,12 @@ document.addEventListener('DOMContentLoaded', () => {
   if (themeBtn) themeBtn.addEventListener('click', () => applyTheme(!document.body.classList.contains('light')));
   initAutoReloadCheckbox();
   startLoadingDots();
+  const piaBrand = document.getElementById('footerBrandPia');
+  if (piaBrand) {
+    piaBrand.addEventListener('click', () => {
+      window.open('https://eagleviewcloud.sharepoint.com/sites/QualityTeam/SitePages/PIA.aspx', '_blank', 'noopener');
+    });
+  }
   /* ── Type toggle states ── */
   [
     { id: 'm-chkLive',     defaultOn: true  },
@@ -1829,6 +1901,24 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.setItem('myInputState_q', this.value);
     applyAllFilters('q');
   });
+  /* Stat pills → click to filter the search box by that state
+     (clicking an already-active pill clears the filter). */
+  function wirePillFilter(pillId, prefix, filterText){
+    const pill = document.getElementById(pillId);
+    if (!pill) return;
+    pill.addEventListener('click', () => {
+      const input = document.getElementById(`${prefix}-myInput`);
+      if (!input) return;
+      const isActive = input.value.trim().toLowerCase() === filterText.toLowerCase();
+      input.value = isActive ? '' : filterText;
+      localStorage.setItem(`myInputState_${prefix}`, input.value);
+      applyAllFilters(prefix);
+    });
+  }
+  wirePillFilter('m-statRTM',  'm', 'Ready To Measure');
+  wirePillFilter('m-statBM',   'm', 'Being Measured');
+  wirePillFilter('q-statRFQC', 'q', 'Ready For QC');
+  wirePillFilter('q-statBQC',  'q', 'Being Qced');
   /* Type toggle buttons */
   document.querySelectorAll('#panel-measure .toggle-btn:not(.loc-btn)').forEach(btn => {
     btn.addEventListener('click', function() {
@@ -1865,6 +1955,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   initColumnVisibility('measure-table', 'hiddenCols_measure', 'm-columnControls');
   initColumnVisibility('qc-table',      'hiddenCols_qc',      'q-columnControls');
+  document.getElementById('m-exportCsv')?.addEventListener('click', () => exportTableToCsv('measure-table'));
+  document.getElementById('q-exportCsv')?.addEventListener('click', () => exportTableToCsv('qc-table'));
   /* Row click → report detail modal
      (bound to the table, not the tbody: sorting replaces the tbody node
      via cloneNode/replaceChild, which would otherwise drop a listener
@@ -1907,7 +1999,7 @@ function startReloadTimer() {
   }
   stopReloadTimer();
   reloadTimerStarted = true;
-  let reloadSeconds = 300;
+  let reloadSeconds = 600;
   reloadTimerInterval = setInterval(() => {
     if (!autoReloadEnabled) return;
     const overlay = document.getElementById('reportDetailOverlay');
@@ -2192,7 +2284,7 @@ function applyAllFilters(prefix){
   });
   const anyLocActive=activeLocs.length>0;
   const locCellIndex=prefix==='m'?8:7;
-  let visibleLive=0,visibleLate=0,visibleTotal=0;
+  let visibleLate=0,visibleTotal=0,visibleRTM=0,visibleBM=0,visibleRFQC=0,visibleBQC=0;
   const visibleBeingMeasuredUsernames = new Map();
   document.querySelectorAll(`#${prefix}-data tr`).forEach(row=>{
     const rowType=row.dataset.type;
@@ -2213,27 +2305,44 @@ function applyAllFilters(prefix){
     row.style.display=show?'':'none';
     if(show){
       visibleTotal++;
-      if(isLive)visibleLive++;
       const dueCell=row.cells[row.cells.length-1];
       if(dueCell&&dueCell.style.color==='red')visibleLate++;
-      if(prefix==='m' && !isTrain && row.cells.length>=5){
+      if(prefix==='m' && row.cells.length>=5){
         const stateText=row.cells[3].textContent.trim();
         if(stateText.includes('Being Measured')){
-          const username=row.cells[2].textContent.trim();
-          if(username) visibleBeingMeasuredUsernames.set(username,(visibleBeingMeasuredUsernames.get(username)||0)+1);
+          visibleBM++;
+          if(!isTrain){
+            const username=row.cells[2].textContent.trim();
+            if(username) visibleBeingMeasuredUsernames.set(username,(visibleBeingMeasuredUsernames.get(username)||0)+1);
+          }
+        } else if(stateText.includes('Ready To Measure')){
+          visibleRTM++;
         }
+      } else if(prefix==='q' && row.cells.length>=3){
+        const stateText=row.cells[2].textContent.trim();
+        if(stateText.includes('Ready For QC')) visibleRFQC++;
+        else if(/Being Qced/i.test(stateText)) visibleBQC++;
       }
     }
   });
   const fc=document.getElementById(`${prefix}-fileCount`);
   if(fc)fc.innerHTML=`Reports (${visibleTotal})`;
-  const pl=document.getElementById(`${prefix}-statLive`);
   const pt=document.getElementById(`${prefix}-statLate`);
   const pn=document.getElementById(`${prefix}-statTotal`);
-  if(pl)pl.textContent=`Live: ${visibleLive}`;
   if(pt)pt.textContent=`Due: ${visibleLate}`;
   if(pn)pn.textContent=`Total: ${visibleTotal}`;
-  if(prefix==='m') renderDuplicateUsernameAlerts(visibleBeingMeasuredUsernames);
+  if(prefix==='m'){
+    const prtm=document.getElementById('m-statRTM');
+    const pbm=document.getElementById('m-statBM');
+    if(prtm){prtm.textContent=`RTM: ${visibleRTM}`;prtm.classList.toggle('stat-pill-filter-active',searchValue==='ready to measure');}
+    if(pbm){pbm.textContent=`BM: ${visibleBM}`;pbm.classList.toggle('stat-pill-filter-active',searchValue==='being measured');}
+    renderDuplicateUsernameAlerts(visibleBeingMeasuredUsernames);
+  } else {
+    const prfqc=document.getElementById('q-statRFQC');
+    const pbqc=document.getElementById('q-statBQC');
+    if(prfqc){prfqc.textContent=`RFQC: ${visibleRFQC}`;prfqc.classList.toggle('stat-pill-filter-active',searchValue==='ready for qc');}
+    if(pbqc){pbqc.textContent=`BQC: ${visibleBQC}`;pbqc.classList.toggle('stat-pill-filter-active',searchValue==='being qced');}
+  }
 }
 /* ── buildTimeCells ── */
 function formatElapsedHuman(totalSeconds){
@@ -2522,6 +2631,222 @@ function openReportDetailModal(details){
     loadReportImages(details.reportID, details.locationName);
   }
 }
+/* ----------------------------------------------------------------------
+   Row right-click context menu
+   Copy Report ID / Copy Row Details / Overview / Gmaps / Explorer.
+   Right-click anywhere that isn't a data row is suppressed entirely
+   (no native browser/WebView2 context menu).
+   ---------------------------------------------------------------------- */
+function cellVisibleText(td){
+  // Render <br> as a separator instead of letting textContent collapse
+  // multi-line cell content (rework/reject history, etc.) together.
+  const clone = td.cloneNode(true);
+  clone.querySelectorAll('br').forEach(br => br.replaceWith('; '));
+  return clone.textContent.replace(/\s+/g, ' ').trim();
+}
+function csvEscape(value){
+  const str = String(value == null ? '' : value);
+  return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+function exportTableToCsv(tableId){
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const headerCells = [...(table.tHead?.rows[0]?.cells || [])];
+  const visibleColIdx = headerCells
+    .map((th, i) => ({ th, i }))
+    .filter(({ th }) => !th.classList.contains('hidden-column'))
+    .map(({ i }) => i);
+  if (!visibleColIdx.length) return;
+  const headerLine = visibleColIdx
+    .map(i => csvEscape(headerCells[i].textContent.replace(/[↑↓]/g, '').trim()))
+    .join(',');
+  const rows = [...table.tBodies].flatMap(tb => [...tb.rows])
+    .filter(row => row.style.display !== 'none' && !row.classList.contains('skeleton-row'));
+  const dataLines = rows.map(row =>
+    visibleColIdx.map(i => csvEscape(cellVisibleText(row.cells[i]))).join(',')
+  );
+  const csvContent = [headerLine, ...dataLines].join('\r\n');
+  const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = `${tableId}_${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function buildRowDetailsText(tr){
+  if (!tr) return '';
+  return [...tr.cells]
+    .filter(td => !td.classList.contains('hidden-column'))
+    .map(cellVisibleText)
+    .join('\t');
+}
+async function copyTextToClipboard(text){
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity  = '0';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    } catch (fallbackErr) {
+      console.error('copyTextToClipboard failed:', fallbackErr);
+      return false;
+    }
+  }
+}
+(function initRowContextMenu(){
+  const menu = document.createElement('div');
+  menu.className = 'row-context-menu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-hidden', 'true');
+  const ITEMS = [
+    { key: 'copyId',    label: '⧉ Copy Report ID' },
+    { key: 'copyRow',    label: '⎘ Copy Row Details' },
+    { sep: true },
+    { key: 'overview',  label: '▤ Overview' },
+    { key: 'gmaps',     label: '📍 Gmaps' },
+    { key: 'explorer',  label: '🛰️ Explorer' },
+    { sep: true },
+    { key: 'refresh',   label: '↻ Refresh' }
+  ];
+  ITEMS.forEach(item => {
+    if (item.sep) {
+      const sep = document.createElement('div');
+      sep.className = 'row-context-menu-sep';
+      menu.appendChild(sep);
+      return;
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'row-context-menu-item';
+    btn.dataset.action = item.key;
+    btn.textContent = item.label;
+    menu.appendChild(btn);
+  });
+  document.body.appendChild(menu);
+  let activeDetails = null;
+  let activeTr = null;
+  function closeMenu(){
+    menu.classList.remove('row-context-menu-open');
+    menu.setAttribute('aria-hidden', 'true');
+    activeDetails = null;
+    activeTr = null;
+  }
+  function flashLabel(btn, tempLabel){
+    const original = btn.textContent;
+    btn.textContent = tempLabel;
+    setTimeout(() => { closeMenu(); btn.textContent = original; }, 450);
+  }
+  function openMenu(x, y, details, tr){
+    activeDetails = details;
+    activeTr = tr;
+    // Row-specific items (and their separators) only make sense when the
+    // click actually landed on a data row; a right-click on empty space
+    // (background, header, etc.) should offer Refresh only.
+    const isRowContext = !!details;
+    menu.querySelectorAll('.row-context-menu-item, .row-context-menu-sep').forEach(el => {
+      const isRefresh = el.dataset.action === 'refresh';
+      el.style.display = (isRowContext || isRefresh) ? '' : 'none';
+    });
+    if (isRowContext) {
+      const lat = Number(details.latitude);
+      const lon = Number(details.longitude);
+      const hasCoords = Number.isFinite(lat) && Number.isFinite(lon);
+      const addressParts = [details.address, details.city, details.addressState, details.zip].filter(Boolean);
+      const hasAddress = addressParts.length > 0;
+      const gmapsBtn = menu.querySelector('[data-action="gmaps"]');
+      const explorerBtn = menu.querySelector('[data-action="explorer"]');
+      if (gmapsBtn) { gmapsBtn.disabled = !hasAddress; gmapsBtn.title = hasAddress ? '' : 'No address available'; }
+      if (explorerBtn) { explorerBtn.disabled = !hasCoords; explorerBtn.title = hasCoords ? '' : 'No coordinates available'; }
+    }
+    // Render off-screen first to measure, then clamp inside the viewport.
+    menu.style.left = '0px';
+    menu.style.top  = '0px';
+    menu.classList.add('row-context-menu-open');
+    menu.setAttribute('aria-hidden', 'false');
+    const menuW = menu.offsetWidth;
+    const menuH = menu.offsetHeight;
+    const clampedX = Math.min(x, window.innerWidth  - menuW - 6);
+    const clampedY = Math.min(y, window.innerHeight - menuH - 6);
+    menu.style.left = Math.max(6, clampedX) + 'px';
+    menu.style.top  = Math.max(6, clampedY) + 'px';
+  }
+  menu.addEventListener('click', e => {
+    const btn = e.target.closest('.row-context-menu-item');
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.action !== 'refresh' && !activeDetails) return;
+    const details = activeDetails;
+    const tr = activeTr;
+    switch (btn.dataset.action) {
+      case 'copyId':
+        copyTextToClipboard(String(details.reportID ?? ''));
+        flashLabel(btn, 'Copied!');
+        return;
+      case 'copyRow':
+        copyTextToClipboard(buildRowDetailsText(tr));
+        flashLabel(btn, 'Copied!');
+        return;
+      case 'overview':
+        if (tr) highlightRow(tr);
+        openReportDetailModal(details);
+        break;
+      case 'gmaps': {
+        const addressParts = [details.address, details.city, details.addressState, details.zip].filter(Boolean);
+        if (addressParts.length) window.open(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addressParts.join(', '))}`, '_blank', 'noopener');
+        break;
+      }
+      case 'explorer': {
+        const lat = Number(details.latitude);
+        const lon = Number(details.longitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) window.open(`https://apps.eagleview.com/cloudexplorer#lat=${lat}&lon=${lon}&zoom=20&view=O`, '_blank', 'noopener');
+        break;
+      }
+      case 'refresh':
+        window.location.reload();
+        return;
+    }
+    closeMenu();
+  });
+  document.addEventListener('contextmenu', e => {
+    // Suppress the native context menu everywhere. Right-clicking an actual
+    // data row shows the full menu; right-clicking anywhere else shows a
+    // Refresh-only menu instead of nothing.
+    e.preventDefault();
+    const tr = e.target.closest('tr[data-detail-key]');
+    const details = tr ? rowDetailsStore[tr.dataset.detailKey] : null;
+    if (!details) {
+      document.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
+      openMenu(e.clientX, e.clientY, null, null);
+      return;
+    }
+    highlightRow(tr);
+    openMenu(e.clientX, e.clientY, details, tr);
+  });
+  document.addEventListener('click', e => {
+    // Clicks inside the context menu manage the row highlight themselves
+    // (e.g. "Overview" re-highlights the row it opens), so leave those alone.
+    if (menu.contains(e.target)) return;
+    closeMenu();
+    document.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
+  });
+  document.addEventListener('scroll', closeMenu, true);
+  window.addEventListener('resize', closeMenu);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeMenu();
+  });
+})();
 function buildImageSkeletons(count = 5){
   return Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
 }
@@ -3107,7 +3432,7 @@ let q_pendingFetches=0, q_fileCount=0;
 (function initTripleClock() {
   const CLOCKS = [
     { timeId: 'clock-time-ph',  iconId: 'clock-icon-ph',  itemId: 'clock-ph',  tz: 'Asia/Manila',        label: 'PH' },
-    { timeId: 'clock-time-pst', iconId: 'clock-icon-pst', itemId: 'clock-pst', tz: 'America/Los_Angeles', label: 'US', labelId: 'clock-label-pst', dynamicLabel: true },
+    { timeId: 'clock-time-pst', iconId: 'clock-icon-pst', itemId: 'clock-pst', tz: 'America/Los_Angeles', label: 'US', labelId: 'clock-label-pst', dynamicLabel: false },
     { timeId: 'clock-time-bog', iconId: 'clock-icon-bog', itemId: 'clock-bog', tz: 'America/Bogota',     label: 'BOG' }
   ];
   function getDayNightIcon(hour) {
@@ -3578,7 +3903,7 @@ let q_pendingFetches=0, q_fileCount=0;
 function Get-FileInfoExeLocal {
     $cacheDir   = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
     $localExe   = Join-Path $cacheDir 'fileinfo.exe'
-    $remoteBase = '\\mnl-pure01.mnl.eagleview.com\PublicFolder\1_Coordinators\PIA\fileinfo'
+    $remoteBase = 'P:\1_Coordinators\PIA\fileinfo'
     $remoteExe  =
         if (Test-Path -LiteralPath "$remoteBase.exe" -PathType Leaf) { "$remoteBase.exe" }
         elseif (Test-Path -LiteralPath $remoteBase -PathType Leaf) { $remoteBase }
@@ -4230,6 +4555,12 @@ catch {
 $webView.add_CoreWebView2InitializationCompleted({
     param($eventSender, $e)
     if ($e.IsSuccess) {
+        # Disable WebView2's own browser-style right-click menu (Reload,
+        # Back, View Source, etc.). The page has its own custom row context
+        # menu with a JS-level e.preventDefault(), but that only covers the
+        # HTML document; without this setting the native Chromium menu can
+        # still surface on top of/before it, which is what showed "Refresh".
+        try { $webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = $false } catch { }
         $webView.CoreWebView2.Navigate($prefix)
         try { $webView.Focus() | Out-Null } catch { }
         # Any window.open()/target="_blank" link (e.g. the Explorer and
