@@ -3867,7 +3867,7 @@ function startTileSpin(el, geo){
     last = ts;
     const lb = document.getElementById('imageLightbox');
     if (document.hidden || (lb && lb.classList.contains('open')) || !el.offsetParent || (shown && el.matches(':hover'))) return;
-    tileSpin.yaw += 0.35 * dt;
+    tileSpin.yaw += 0.15 * dt;
     const dpr = window.devicePixelRatio || 1, w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
     if (!w || !h) return;
     if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
@@ -3888,7 +3888,7 @@ function view3dRedraw(){
 }
 function view3dLoop(){
   const st = view3dState;
-  if (st.auto) { st.yaw += 0.006; view3dRedraw(); }
+  if (st.auto) { st.yaw += 0.0025; view3dRedraw(); }
   st.raf = requestAnimationFrame(view3dLoop);
 }
 // One on/off button per facet-type flag that occurs in this model, placed before "Reset view".
