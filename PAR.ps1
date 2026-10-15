@@ -14,18 +14,35 @@ param(
     # Keep the browser's normal CORS enforcement instead of relaxing it.
     [switch]$EnforceWebSecurity,
     # Force re-download of the WebView2 SDK assemblies even if cached.
-    [switch]$ForceWebView2Refresh
+    [switch]$ForceWebView2Refresh,
+    # Silence the terminal log (startup, requests, image/file-info/wireframe work, errors).
+    [switch]$Quiet
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 
 # ============================================================
-#  SHORTCUT SELF-DEPLOY
+#  TERMINAL LOGGING
 # ============================================================
-$Desktop = [Environment]::GetFolderPath("Desktop")
-Copy-Item -Path "P:\1_Coordinators\PIA\PAR.lnk" `
-          -Destination "$Desktop\PAR.lnk" `
-          -Force -ErrorAction SilentlyContinue
+# Timestamped, colour-coded lines in this PowerShell window showing what PAR is
+# doing: startup, access check, every local API request (with status + time),
+# image / file-info / wireframe work, python output, and errors from the page.
+# Run with -Quiet to silence it. Never throws.
+$ParLogEnabled = -not $Quiet
+function Write-ParLog {
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Message,
+        [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO',
+        [Parameter(Position = 2)][string]$Source = 'PAR'
+    )
+    if (-not $ParLogEnabled) { return }
+    try {
+        $color = switch ($Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'DEBUG' { 'DarkGray' } default { 'Cyan' } }
+        Write-Host ("[{0}] [{1,-5}] [{2}] {3}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Level, $Source, $Message) -ForegroundColor $color
+    }
+    catch { }
+}
+Write-ParLog "PAR starting (user $env:USERNAME on $env:COMPUTERNAME)" 'INFO' 'startup'
 
 # ============================================================
 #  USAGE LOGGING
@@ -34,10 +51,17 @@ Copy-Item -Path "P:\1_Coordinators\PIA\PAR.lnk" `
 # using PAR and when. Never throws — a log failure must not block the app.
 function Write-ParUsageLog {
     param(
-        [string]$LogPath = "P:\1_Coordinators\PIA\PAR\Logs\PAR_usage.csv",
+        [string]$LogPath = $script:ParConfig.LogPath,
         [string]$Action  = 'Launch',
         [string]$Details = ''
     )
+    try {
+        $echoLevel = if ($Action -match 'Fail|Restricted') { 'WARN' } elseif ($Action -match 'Passed') { 'OK' } else { 'DEBUG' }
+        $echoText  = if ($Details) { "$Action | $Details" } else { $Action }
+        if ($echoText.Length -gt 220) { $echoText = $echoText.Substring(0, 220) + '...' }
+        Write-ParLog $echoText $echoLevel 'usage'
+    }
+    catch { }
     try {
         $logDir = Split-Path -Path $LogPath -Parent
         if (-not (Test-Path $logDir)) {
@@ -64,18 +88,131 @@ function Write-ParUsageLog {
         catch { }
     }
 }
-Write-ParUsageLog -Action 'Launch'
+# ============================================================
+#  CONFIG FILE  (config.json)  -- CHECKED FIRST, ON EVERY LAUNCH
+# ============================================================
+# PAR will not run unless Files\config.json (next to PAR.ps1) can be found and read.
+# Fields:
+#   Enabled              true/false - false blocks PAR for everyone
+#   AllowedRoles         [10, ...]  - user needs at least ONE of these role IDs
+#   LogPath              full path of the shared usage-log CSV
+#   Version              version shown in the PAR footer
+#   TerminalDebugLogging true/false - false silences the terminal/debug output
+#                                     (same as running PAR with -Quiet)
+#   PythonPath           python.exe of the portable Python (numpy/scipy/matplotlib
+#                                     preinstalled), used before any other Python.
+#                                     %VAR% placeholders are expanded. TESTING: local
+#                                     %LOCALAPPDATA%\PAR-App\python; later the PIA share
+# Config missing, unreachable (off VPN / P: not mapped) or not valid JSON =>
+# PAR shows a message and exits. Every field above is REQUIRED - a missing or
+# invalid field is treated the same as a missing file (no defaults).
+$ParScriptVersion = '3.10.15'
+# Layout (everything is located relative to this script, no other locations):
+#   PAR\PAR.ps1
+#   PAR\PAR.lnk
+#   PAR\Files\config.json, fileinfo.py, roof_wireframe.py, 3d_wireframe.py
+$ParRoot          = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ParFilesDir      = Join-Path $ParRoot 'Files'
+$ParConfigPath    = Join-Path $ParFilesDir 'config.json'
+
+function ConvertTo-ParBool {
+    param($Value)
+    if ($Value -is [bool]) { return $Value }
+    return -not ("$Value".Trim() -match '^(false|0|no|off|disabled|)$')
+}
+
+# Returns the config hashtable, or $null (with $script:ParConfigError set) when
+# the file is missing, unreachable or unreadable.
+function Get-ParConfig {
+    $script:ParConfigError = $null
+    try {
+        if (-not (Test-Path -LiteralPath $ParConfigPath)) {
+            $script:ParConfigError = "config file not found or unreachable: $ParConfigPath"
+            return $null
+        }
+        $json = Get-Content -LiteralPath $ParConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $json) { throw 'config file is empty' }
+    }
+    catch {
+        $script:ParConfigError = "config file could not be read: $($_.Exception.Message)"
+        return $null
+    }
+    try {
+        $roles = @($json.AllowedRoles | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+        if ($roles.Count -eq 0) { throw 'AllowedRoles is missing or empty' }
+        foreach ($key in 'Enabled', 'TerminalDebugLogging') {
+            if ($null -eq $json.$key -or "$($json.$key)" -notmatch '^(true|false)$') { throw "$key must be true or false" }
+        }
+        foreach ($key in 'LogPath', 'Version', 'PythonPath') {
+            if (-not "$($json.$key)".Trim()) { throw "$key is missing or empty" }
+        }
+        $cfg = @{
+            Enabled              = ("$($json.Enabled)" -eq 'true')
+            AllowedRoles         = $roles
+            LogPath              = "$($json.LogPath)".Trim()
+            Version              = "$($json.Version)".Trim()
+            TerminalDebugLogging = ("$($json.TerminalDebugLogging)" -eq 'true')
+            # %VAR% placeholders (e.g. %LOCALAPPDATA%) are expanded per machine.
+            PythonPath           = [Environment]::ExpandEnvironmentVariables("$($json.PythonPath)".Trim())
+            Source               = $ParConfigPath
+        }
+    }
+    catch {
+        $script:ParConfigError = "config file has a missing or invalid value: $($_.Exception.Message)"
+        return $null
+    }
+    return $cfg
+}
+
+$ParConfig = Get-ParConfig
+if (-not $ParConfig) {
+    # No usable config => PAR does not run. LogPath is unknown here, so the
+    # attempt is recorded in the local fallback log only.
+    Write-ParLog "config check FAILED - $ParConfigError" 'ERROR' 'config'
+    Write-ParUsageLog -Action 'ConfigFailed' -Details $ParConfigError
+    [System.Windows.MessageBox]::Show(
+        "PAR can't start because its configuration file couldn't be loaded.`n`n" +
+        "Check your network / VPN connection (P: drive) and try again, or contact PIA if this continues.",
+        'PAR - config unavailable', 'OK', 'Error') | Out-Null
+    exit 1
+}
+
+# Terminal debug switch from the config (-Quiet on the command line still wins).
+$ParLogEnabled = (-not $Quiet) -and $ParConfig.TerminalDebugLogging
+Write-ParLog ("config: source={0}; enabled={1}; allowedRoles={2}; version={3}; logPath={4}; terminalDebug={5}; pythonPath={6}" -f $ParConfig.Source, $ParConfig.Enabled, ($ParConfig.AllowedRoles -join ','), $ParConfig.Version, $ParConfig.LogPath, $ParConfig.TerminalDebugLogging, $ParConfig.PythonPath) 'INFO' 'config'
+if ($ParConfig.Version -ne $ParScriptVersion) {
+    Write-ParLog "config version $($ParConfig.Version) differs from this script ($ParScriptVersion) - this copy of PAR.ps1 may be out of date" 'WARN' 'config'
+}
+
+Write-ParUsageLog -Action 'Launch' -Details "version=$($ParConfig.Version); config=$($ParConfig.Source)"
+
+if (-not $ParConfig.Enabled) {
+    Write-ParUsageLog -Action 'RestrictedDisabled' -Details "PAR disabled in config ($($ParConfig.Source))"
+    [System.Windows.MessageBox]::Show(
+        "PAR is currently disabled.`n`nContact PIA",
+        'PAR - disabled', 'OK', 'Warning') | Out-Null
+    exit 1
+}
+
+# ============================================================
+#  SHORTCUT SELF-DEPLOY
+# ============================================================
+$Desktop = [Environment]::GetFolderPath("Desktop")
+Copy-Item -Path (Join-Path $ParRoot 'PAR.lnk') `
+          -Destination "$Desktop\PAR.lnk" `
+          -Force -ErrorAction SilentlyContinue
 
 # ============================================================
 #  ROLE-BASED ACCESS CHECK
 # ============================================================
-# Confirms the launching user holds role 10 (required for PAR access)
-# before the app is allowed to continue.
+# Confirms the launching user holds at least one of the roles listed under
+# AllowedRoles in config.json (default: role 10) before the app is allowed
+# to continue.
 #
 # >>> TEMP DEBUG: Write-ParDebug lines below print each step to the console
-#     for troubleshooting. Set $ParDebugEnabled to $true to see them again;
-#     leave $false (default) to keep the terminal quiet. <<<
-$ParDebugEnabled = $false
+#     for troubleshooting. Enabled by default; run PAR with -Quiet to silence
+#     them (or set $ParDebugEnabled to $false). <<<
+$ParDebugEnabled = $ParLogEnabled
 function Write-ParDebug {
     param([string]$Message, [ConsoleColor]$Color = 'Cyan')
     if ($ParDebugEnabled) {
@@ -214,10 +351,12 @@ catch {
 
 $roleIds = $allRolesResponse | ForEach-Object { $_.roleId }
 Write-ParDebug "[DEBUG] roleIds = $($roleIds -join ',')" -Color Cyan
-Write-ParDebug "[DEBUG] has role 10? $(($roleIds -contains 10))" -Color Cyan
-if (-not $allRolesResponse -or (-not ($allRolesResponse | Where-Object { $_.roleId -eq 10 }))) {
-    Write-ParDebug "[DEBUG] RESULT: RESTRICTED (role 10 not found)" -Color Red
-    Write-ParUsageLog -Action 'Restricted' -Details "userId=$userId; email=$userEmail; roleIds=$(($allRolesResponse | ForEach-Object { $_.roleId }) -join ',')"
+$allowedRoles = @($ParConfig.AllowedRoles)
+$matchedRoles = @($roleIds | Where-Object { $null -ne $_ -and ($allowedRoles -contains [int]$_) })
+Write-ParDebug "[DEBUG] allowed roles = $($allowedRoles -join ','); matched = $($matchedRoles -join ',')" -Color Cyan
+if (-not $allRolesResponse -or $matchedRoles.Count -eq 0) {
+    Write-ParDebug "[DEBUG] RESULT: RESTRICTED (none of the allowed roles found)" -Color Red
+    Write-ParUsageLog -Action 'Restricted' -Details "userId=$userId; email=$userEmail; roleIds=$(($allRolesResponse | ForEach-Object { $_.roleId }) -join ','); allowedRoles=$($allowedRoles -join ',')"
     [System.Windows.MessageBox]::Show(
         "Restricted`n`nContact PIA",
         'PAR — access denied', 'OK', 'Warning') | Out-Null
@@ -226,6 +365,9 @@ if (-not $allRolesResponse -or (-not ($allRolesResponse | Where-Object { $_.role
 Write-ParDebug "[DEBUG] RESULT: ACCESS GRANTED" -Color Green
 
 Write-ParUsageLog -Action 'RoleCheckPassed' -Details "userId=$userId; email=$userEmail"
+Write-ParLog 'Access check finished - terminal logging stays on (run with -Quiet to silence it).' 'INFO' 'PAR'
+# Terminal logging now continues after the role check (requests, image/file-info/wireframe work,
+# python output, page errors); $ParLogEnabled is still passed to the request runspaces.
 # >>> END TEMP DEBUG <<<
 
 # ============================================================================
@@ -283,8 +425,28 @@ PIA members: Pogi, LT, Rona
     </div>
   </div>
   <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
-    <button class="image-lightbox-close" id="imageLightboxClose" title="Close" aria-label="Close">×</button>
+    <button class="image-lightbox-close" id="imageLightboxClose" title="Close (Esc)" aria-label="Close">×</button>
+    <button class="image-lightbox-nav image-lightbox-prev" id="imageLightboxPrev" title="Previous image (←)" aria-label="Previous image">‹</button>
     <img id="imageLightboxImg" src="" alt="Report image full size">
+    <button class="image-lightbox-nav image-lightbox-next" id="imageLightboxNext" title="Next image (→)" aria-label="Next image">›</button>
+    <div class="image-lightbox-caption" id="imageLightboxCaption"></div>
+    <div id="ovToolbar" class="view3d-toolbar ov-toolbar" style="display:none"></div>
+  </div>
+  <div id="view3dViewer" class="image-lightbox view3d-viewer" aria-hidden="true">
+    <button class="image-lightbox-close" id="view3dClose" title="Close (Esc)" aria-label="Close">×</button>
+    <div class="view3d-toolbar">
+      <button type="button" id="view3dSpin">Auto-rotate: off</button>
+      <label class="view3d-shade" title="Shading opacity (100% = default, 0% = off)">Shading <input type="range" id="view3dShade" min="0" max="300" step="5" value="100"><span id="view3dShadeVal">100%</span></label>
+      <button type="button" id="view3dVis" title="Off = facets are opaque: only what is visible from the current viewpoint is shown (lines, points and labels behind facets are hidden)">Transparency: on</button>
+      <button type="button" id="view3dReset">Reset view</button>
+      <span class="view3d-sep" aria-hidden="true"></span>
+      <button type="button" id="view3dPts">Points: on</button>
+      <button type="button" id="view3dLbl">Pitch: on</button>
+    </div>
+    <button class="image-lightbox-nav image-lightbox-prev" id="view3dPrev" title="Previous image (←)" aria-label="Previous image">‹</button>
+    <button class="image-lightbox-nav image-lightbox-next" id="view3dNext" title="Next image (→)" aria-label="Next image">›</button>
+    <canvas id="view3dCanvas"></canvas>
+    <div class="image-lightbox-caption" id="view3dCaption">3D Wireframe  ·  drag to rotate  ·  right-drag to pan  ·  scroll to zoom  ·  double-click to reset</div>
   </div>
   <div class="par-tab-bar">
     <div class="tab-logo-block">
@@ -505,13 +667,15 @@ PIA members: Pogi, LT, Rona
       <div id="reloadTimer">Loading…</div>
     </div>
     <div class="footer-right">
-      <span class="footer-version">version 3.9.2</span>
+      <span class="footer-version">version 3.10.15</span>
     </div>
   </div>
   <script src="src/PAR.js"></script>
 </body>
 </html>
 '@
+# Footer version comes from config.json (falls back to the script's own version).
+$ParHtml = $ParHtml.Replace('version 3.10.15</span>', "version $($ParConfig.Version)</span>")
 $ParCss = @'
 /* ============================================================================
    PAR.css — Combined stylesheet
@@ -895,20 +1059,21 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-overlay.open .detail-modal { transform: translateY(0) scale(1); opacity: 1; }
 .detail-modal-header {
   display: flex; align-items: flex-start; justify-content: space-between;
-  padding: 16px 18px; border-bottom: 1px solid var(--border-light);
+  padding: 9px 18px; border-bottom: 1px solid var(--border-light);
   background: var(--bg-surface); flex-shrink: 0;
 }
 .detail-modal-title { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-primary); }
-.detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.03em; }
+.detail-modal-subtitle { font-size: 11px; color: var(--text-muted); margin-top: 2px; letter-spacing: 0.03em; }
 .detail-product-line { font-size: 12px; color: var(--text-secondary); font-family: var(--sans); }
 .detail-folder-name { font-size: 11px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.02em; word-break: break-word; }
 .detail-close-btn {
   border: none; background: transparent; color: var(--text-muted);
-  font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px;
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 0 6px;
   border-radius: 6px; transition: background 0.12s, color 0.12s;
 }
 .detail-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-.detail-images-section { flex-shrink: 0; max-height: 200px; overflow-y: auto; padding: 12px 18px 0; }
+/* No height cap / scrollbar here: a cap made the tile area overflow by a few px, and the scrollbar appearing narrowed the tiles (aspect-ratio), which removed it again - hence the flicker on hover. */
+.detail-images-section { flex-shrink: 0; overflow: hidden; padding: 8px 18px 0; }
 .detail-tabs { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px 0; border-bottom: 1px solid var(--border-light); flex-shrink: 0; }
 .detail-tabs-list { display: flex; gap: 4px; }
 .detail-tabs-actions { display: flex; gap: 6px; margin-bottom: 8px; }
@@ -927,7 +1092,7 @@ body.light .table-round { box-shadow: 0 4px 24px rgba(0,0,0,0.1), 0 1px 4px rgba
 .detail-modal-body { flex: 1 1 auto; min-height: 0; padding: 6px 18px 18px; overflow-y: auto; }
 .detail-modal-footer {
   display: flex; align-items: center; justify-content: flex-end; gap: 10px;
-  padding: 12px 18px; border-top: 1px solid var(--border-light);
+  padding: 5px 18px; border-top: 1px solid var(--border-light);
   background: var(--bg-surface); flex-shrink: 0;
 }
 .detail-footer-meta {
@@ -1028,37 +1193,124 @@ body.light .row-context-menu { box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8p
   letter-spacing: 0.02em; color: var(--text-muted); margin-left: 8px;
 }
 .detail-images-grid {
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+  display: grid; grid-template-columns: repeat(12, 1fr); gap: 8px;
+  justify-content: center; justify-items: stretch; align-items: center;
 }
 @media (max-width: 480px) {
   .detail-images-grid { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
 }
 .detail-image-thumb {
-  position: relative; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden;
+  position: relative; grid-column: span 3; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden;
   background: var(--bg-card); border: 1px solid var(--border-light); cursor: pointer;
 }
 .detail-image-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.15s ease; }
 .detail-image-thumb:hover img { transform: scale(1.06); }
 .detail-image-thumb.img-error { display: none; }
+/* Row 1: Ortho + 3D Wireframe (each half the width); row 2: North, East, West, South (each a quarter). */
+.detail-feature-thumb { grid-column: span 6; aspect-ratio: 4 / 3; }
+.detail-feature-thumb img { object-fit: contain; }
+.detail-overlay-thumb { background: #000; }
+.detail-view3d-thumb { position: relative; }
+.detail-view3d-thumb .tile-spin { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+/* Hipster: plain Ortho photo (left) + 3D Wireframe placeholder (right), above the four direction photos */
+.detail-view3d-placeholder { flex-direction: column; gap: 4px; }
+.detail-view3d-placeholder .ph-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.detail-view3d-placeholder .ph-sub { font-size: 11px; }
+.detail-ortho-plain img, .detail-ortho-plain-img img { object-fit: cover; }
+@media (max-width: 480px) { .detail-image-thumb, .detail-feature-thumb { grid-column: auto; } }
 .detail-image-skel {
   cursor: default;
   background: linear-gradient(90deg, var(--bg-card) 0%, var(--bg-hover) 40%, var(--bg-card) 80%);
   background-size: 200% 100%;
   animation: skeleton-shimmer 1.6s ease-in-out infinite;
 }
+.detail-wireframe-loading-status {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  padding: 5px 9px; background: transparent;
+  color: #fff; font-family: var(--sans); font-size: 11px; font-weight: 500;
+  line-height: 1.3; text-align: center; white-space: nowrap; pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+}
+body.light .detail-wireframe-loading-status { color: #1a1f2e; text-shadow: none; }
 .detail-images-empty { grid-column: 1 / -1; font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0; }
+.detail-wireframe-thumb { background: #fff; }
+.detail-wireframe-thumb img { object-fit: contain; background: #fff; }
+.detail-wireframe-thumb:hover img { transform: none; }
+.detail-wireframe-badge {
+  position: absolute; left: 4px; bottom: 4px; padding: 1px 6px; border-radius: 3px;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+  background: rgba(10,77,140,0.88); color: #fff; pointer-events: none;
+}
+.overlay-wire-toggle {
+  position: absolute; right: 4px; top: 4px; z-index: 2; display: flex; align-items: center; gap: 5px;
+  padding: 2px 7px 2px 5px; border: 0; border-radius: 11px; cursor: pointer; user-select: none;
+  background: rgba(10,77,140,0.88); color: #fff; font: 600 9px/1.2 inherit; letter-spacing: 0.03em; text-transform: uppercase;
+}
+.overlay-wire-toggle .ow-track { position: relative; width: 20px; height: 11px; border-radius: 6px; background: rgba(255,255,255,0.35); transition: background 0.15s ease; }
+.overlay-wire-toggle .ow-track::after { content: ''; position: absolute; top: 1px; left: 1px; width: 9px; height: 9px; border-radius: 50%; background: #fff; transition: transform 0.15s ease; }
+.overlay-wire-toggle.on .ow-track { background: #04AA6D; }
+.lb-wire-switch { top: 22px; left: 24px; right: auto; padding: 6px 13px 6px 9px; font-size: 11px; background: rgba(0,0,0,0.6); }
+.overlay-wire-toggle.on .ow-track::after { transform: translateX(9px); }
+.detail-wireframe-reason { margin-top: 4px; font-size: 8px; line-height: 1.25; word-break: break-word; opacity: 0.85; }
+.detail-wireframe-error {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  padding: 6px; font-size: 10px; color: var(--text-muted); cursor: default; background: var(--bg-card);
+}
 .image-lightbox {
   position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.82);
   display: flex; align-items: center; justify-content: center;
   opacity: 0; pointer-events: none; transition: opacity 0.15s ease;
 }
 .image-lightbox.open { opacity: 1; pointer-events: auto; }
-.image-lightbox img { max-width: 90vw; max-height: 88vh; border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5); }
+.image-lightbox { overflow: hidden; }
+/* Every preview image is shown at the same height. */
+.image-lightbox img {
+  height: 88vh; width: auto; max-width: 94vw; object-fit: contain;
+  border-radius: 6px; box-shadow: 0 12px 48px rgba(0,0,0,0.5);
+  transform-origin: 50% 50%; will-change: transform; user-select: none; -webkit-user-drag: none;
+}
+.image-lightbox img.zoomed { cursor: grab; }
+.image-lightbox img.dragging { cursor: grabbing; }
+.image-lightbox-close, .image-lightbox-nav, .image-lightbox-caption { z-index: 2; }
 .image-lightbox-close {
   position: absolute; top: 18px; right: 24px; border: none; background: transparent; color: #fff;
   font-size: 28px; cursor: pointer; line-height: 1; padding: 4px 10px; border-radius: 6px;
 }
 .image-lightbox-close:hover { background: rgba(255,255,255,0.12); }
+.image-lightbox-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 46px; height: 68px; border: none; border-radius: 8px;
+  background: rgba(255,255,255,0.10); color: #fff;
+  font-size: 38px; line-height: 1; cursor: pointer; padding: 0 0 4px;
+  transition: background 0.12s;
+}
+.image-lightbox-nav:hover { background: rgba(255,255,255,0.24); }
+.detail-view3d-thumb { background: #fff; }
+.detail-view3d-thumb img { object-fit: contain; background: #fff; }
+.view3d-viewer canvas {
+  width: min(94vw, 1500px); height: 88vh; background: #fff; border-radius: 6px;
+  box-shadow: 0 12px 48px rgba(0,0,0,0.5); cursor: grab; touch-action: none; display: block;
+}
+.view3d-viewer canvas.dragging { cursor: grabbing; }
+.view3d-toolbar { position: absolute; top: 18px; left: 24px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 110px); z-index: 2; }
+.view3d-sep { align-self: stretch; width: 1px; margin: 2px 4px; background: rgba(255,255,255,0.35); }
+.view3d-toolbar label.view3d-shade { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.10); color: #fff; font-family: var(--sans); font-size: 12px; padding: 4px 12px; border-radius: 6px; }
+.view3d-toolbar label.view3d-shade input { width: 110px; cursor: pointer; }
+.view3d-toolbar label.view3d-shade span { min-width: 38px; text-align: right; }
+.view3d-toolbar button.off { opacity: 0.5; text-decoration: line-through; }
+.view3d-toolbar button {
+  border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.10); color: #fff;
+  font-family: var(--sans); font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+}
+.view3d-toolbar button:hover { background: rgba(255,255,255,0.24); }
+.image-lightbox-prev { left: 18px; }
+.image-lightbox-next { right: 18px; }
+.image-lightbox-caption {
+  position: absolute; bottom: 34px; left: 50%; transform: translateX(-50%);
+  padding: 3px 14px; border-radius: 12px; background: rgba(0,0,0,0.6); color: #fff;
+  font-family: var(--sans); font-size: 12px; letter-spacing: 0.03em; white-space: nowrap;
+  pointer-events: none;
+}
 .par-table td {
   padding:7px 12px; color:var(--text-primary);
   text-align:center; vertical-align:middle; border:none;
@@ -1776,6 +2028,30 @@ $ParJs = @'
 /* ============================================================================
    Created and developed by PIA — members: Pogi, LT, Rona
    ============================================================================ */
+/* ── TERMINAL LOG BRIDGE ──
+   parLog(level, message) forwards a line to the PowerShell window (level: info|ok|warn|error).
+   console.error / console.warn and uncaught errors are forwarded too. Never throws. */
+function parLog(level, message){
+  try {
+    const text = String(message == null ? '' : message).slice(0, 600);
+    if (window.chrome && window.chrome.webview) {
+      window.chrome.webview.postMessage(JSON.stringify({ level: level, message: text }));
+    }
+  } catch (e) { /* logging must never break the UI */ }
+}
+(function hookConsoleForTerminal(){
+  const origError = console.error.bind(console);
+  const origWarn  = console.warn.bind(console);
+  const fmt = args => Array.from(args).map(a => {
+    if (a && a.message) return a.message;
+    if (a && typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+    return String(a);
+  }).join(' ');
+  console.error = function(){ origError.apply(null, arguments); parLog('error', fmt(arguments)); };
+  console.warn  = function(){ origWarn.apply(null, arguments);  parLog('warn',  fmt(arguments)); };
+  window.addEventListener('error', e => parLog('error', `Uncaught: ${e.message} (${e.filename || ''}:${e.lineno || 0})`));
+  window.addEventListener('unhandledrejection', e => parLog('error', `Unhandled promise rejection: ${(e.reason && e.reason.message) ? e.reason.message : e.reason}`));
+})();
 /* ── SERVER TIMEZONE ── */
 const SERVER_TZ = 'America/Los_Angeles';
 function getLAOffsetMs(dateForContext) {
@@ -1827,6 +2103,168 @@ let q_trainingFetched = false;
 const rowDetailsStore = {};
 let imageLoadToken = 0;
 let fileInfoLoadToken = 0;
+let wireframeToken = 0;
+// Generated tiles shown after the top-down image: the wireframe drawn over the
+// top-down photo (2D) and the rotatable 3D wireframes.
+const WF_TILES = {
+  overlay:   { id: 'detailOverlayThumb',   label: 'Ortho', query: '&overlay=1', cls: 'detail-overlay-thumb',   loading: 'Generating overlay…' },
+  // 3D Wireframe: the server returns 3D geometry (JSON); the tile shows a snapshot of it and a click opens a rotatable viewer.
+  view3d:    { id: 'detailView3dThumb',    label: '3D Wireframe', query: '&view3d=1', cls: 'detail-view3d-thumb', loading: 'Generating 3D wireframes…' }
+};
+const wireframeStates = {};
+/* ── Photo overlays: Ortho (top-down) + North / East / South / West ─────────────────────────────
+   The wireframe is drawn on each photo in the browser, from the 3D geometry (geo.P / S / F / A) and the photo's own
+   projection (geo.V[key] = first 3 rows of its ImageData FwdXform: photo x, photo y, depth). The tile shows the
+   defaults below; the preview has the same buttons as the 3D Wireframe viewer (except Auto-rotate). */
+const OV_WALL = 1024, OV_FLOOR = 2048;
+const PHOTO_DIRS = { North: 'N', East: 'E', South: 'S', West: 'W' };
+const ovStates = {};   // key (O/N/E/S/W) -> { pts, labels, hide, shade, occlude } for the open report
+const ovCache = {};    // key -> { status: 'busy'|'ready'|'error', src }  (default-state composite = tile image)
+const ovImgs = {};     // photo url -> Promise<HTMLImageElement>
+let reportNoWireframe = false;   // Hipster reports: no wireframes are generated; the top-down photo is shown as a plain Ortho tile
+let reportTopDownSrc = '';   // top-down (Ortho) photo URL of the open report - not shown as a tile for Twister
+let reportImagesDone = false;
+let ovPreviewKey = '', ovRaf = 0;
+function ovState(key){
+  if (!ovStates[key]) ovStates[key] = key === 'O'
+    ? { pts: false, labels: true,  hide: OV_WALL | OV_FLOOR, shade: 0, occlude: false }   // Ortho: Points off, Pitch on, Wall off, Floor off, Transparency on
+    : { pts: false, labels: false, hide: OV_FLOOR,          shade: 0, occlude: true };   // N/E/W/S: Points off, Pitch off, Wall on, Floor off, Transparency off
+  return ovStates[key];
+}
+/* A button change in any image preview (Ortho, North, East, South, West or the 3D Wireframe view) applies to all of them. */
+function previewShare(apply){
+  ['O', 'N', 'E', 'S', 'W'].forEach(k => apply(ovState(k)));
+  apply(view3dState);
+}
+function previewShareHide(bit, off){ previewShare(s => { s.hide = off ? (s.hide | bit) : (s.hide & ~bit); }); }
+function ovLoadImage(src){
+  if (!ovImgs[src]) ovImgs[src] = new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('photo failed to load')); im.src = src; });
+  return ovImgs[src];
+}
+function renderOverlayCanvas(key, photo, geo, st){
+  const W = photo.naturalWidth, H = photo.naturalHeight;
+  const k = W < 1200 ? Math.min(2.5, 1200 / W) : 1;   // small photos are drawn larger so lines and labels stay crisp
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(W * k); cv.height = Math.round(H * k);
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(photo, 0, 0, cv.width, cv.height);
+  const M = geo.V[key];
+  // The 3D JSON has z reversed; FwdXform takes the original z.
+  const project = p => { const x = p[0], y = p[1], z = -p[2];
+    return [(M[0][0] * x + M[0][1] * y + M[0][2] * z + M[0][3]) * k, (M[1][0] * x + M[1][1] * y + M[1][2] * z + M[1][3]) * k, M[2][0] * x + M[2][1] * y + M[2][2] * z + M[2][3]]; };
+  drawView3d(ctx, cv.width, cv.height, geo, { custom: project, zoom: 1, pts: st.pts, labels: st.labels, hide: st.hide, shade: st.shade, occlude: st.occlude }, Math.max(1, cv.width / 900));
+  return cv;
+}
+function ovPlainSrc(key){
+  if (key === 'O') return reportTopDownSrc;
+  const img = document.querySelector(`#detailImagesGrid img[data-dir="${key}"]`);
+  return img ? (img.dataset.plainSrc || img.getAttribute('src') || '') : '';
+}
+// Draws the default-state overlay onto each photo once the 3D geometry and the photos are both available.
+function buildOverlayComposites(){
+  if (reportNoWireframe) return;
+  const g = wireframeStates.view3d;
+  if (!g) return;
+  const ovWaiting = () => { const o = wireframeStates.overlay; return o && (o.status === 'loading' || o.status === 'pending'); };
+  if (g.status === 'error') {
+    if (ovWaiting()) { wireframeStates.overlay = { status: 'error', src: null, error: g.error, detail: '' }; renderWireframeThumb(); }
+    return;
+  }
+  if (g.status !== 'ready' || !g.geo) return;
+  const token = wireframeToken;
+  ['O', 'N', 'E', 'S', 'W'].forEach(key => {
+    if (ovCache[key]) return;
+    if (!g.geo.V || !g.geo.V[key]) {
+      ovCache[key] = { status: 'error', src: '' };
+      if (key === 'O' && ovWaiting()) { wireframeStates.overlay = { status: 'error', src: null, error: 'No top-down projection in this EVM', detail: '' }; renderWireframeThumb(); }
+      return;
+    }
+    const plain = ovPlainSrc(key);
+    if (!plain) {
+      if (key === 'O' && reportImagesDone && ovWaiting()) { wireframeStates.overlay = { status: 'idle', src: null, error: '', detail: '' }; renderWireframeThumb(); }
+      return;
+    }
+    ovCache[key] = { status: 'busy', src: '' };
+    ovLoadImage(plain).then(photo => {
+      if (token !== wireframeToken) return;
+      const src = renderOverlayCanvas(key, photo, g.geo, ovState(key)).toDataURL('image/jpeg', 0.9);
+      ovCache[key] = { status: 'ready', src };
+      parLog('ok', `${key === 'O' ? 'Ortho' : Object.keys(PHOTO_DIRS).find(n => PHOTO_DIRS[n] === key)}: wireframe overlay ready`);
+      if (key === 'O') wireframeStates.overlay = { status: 'ready', src, error: '', detail: '' };
+      renderWireframeThumb();
+    }).catch(err => {
+      if (token !== wireframeToken) return;
+      ovCache[key] = { status: 'error', src: '' };
+      parLog('warn', `${key}: wireframe overlay failed - ${err && err.message}`);
+    });
+  });
+}
+// Swaps the finished overlay into each N/E/S/W tile (the plain photo stays in img.dataset.plainSrc).
+function applyPhotoWireframes(){
+  const grid = document.getElementById('detailImagesGrid');
+  if (!grid) return;
+  ['N', 'E', 'S', 'W'].forEach(d => {
+    const c = ovCache[d];
+    if (!c || c.status !== 'ready') return;
+    const img = grid.querySelector(`img[data-dir="${d}"]`);
+    if (!img || img.getAttribute('src') === c.src) return;
+    if (!img.dataset.plainSrc) img.dataset.plainSrc = img.getAttribute('src');
+    img.dataset.ovKey = d;
+    img.src = c.src;
+  });
+}
+/* Preview toolbar: Shading, Transparency, Reset view, Points, Pitch + one On/Off button per facet type (Wall, Floor, ...),
+   the same as the 3D Wireframe viewer without Auto-rotate. */
+function hideOvToolbar(){
+  const t = document.getElementById('ovToolbar');
+  if (t) { t.style.display = 'none'; t.innerHTML = ''; }
+  ovPreviewKey = '';
+}
+function ovRenderPreview(){
+  ovRaf = 0;
+  const key = ovPreviewKey, g = wireframeStates.view3d, img = document.getElementById('imageLightboxImg');
+  if (!key || !img || !g || !g.geo) return;
+  ovLoadImage(ovPlainSrc(key)).then(photo => {
+    if (ovPreviewKey !== key) return;
+    img.src = renderOverlayCanvas(key, photo, g.geo, ovState(key)).toDataURL('image/jpeg', 0.92);   // keeps zoom/pan
+  }).catch(() => {});
+}
+function ovQueuePreview(){ if (!ovRaf) ovRaf = requestAnimationFrame(ovRenderPreview); }
+function buildOvToolbar(key){
+  const bar = document.getElementById('ovToolbar'), g = wireframeStates.view3d;
+  if (!bar || !g || !g.geo) return;
+  const st = ovState(key);
+  bar.innerHTML = '';
+  const mk = (title, onClick) => { const b = document.createElement('button'); b.type = 'button'; if (title) b.title = title; b.addEventListener('click', onClick); bar.appendChild(b); return b; };
+  const lab = document.createElement('label');
+  lab.className = 'view3d-shade'; lab.title = 'Shading opacity (100% = default, 0% = off)';
+  lab.innerHTML = `Shading <input type="range" min="0" max="300" step="5" value="${Math.round(st.shade * 100)}"><span>${Math.round(st.shade * 100)}%</span>`;
+  const rng = lab.querySelector('input'), val = lab.querySelector('span');
+  rng.addEventListener('input', () => { const sh = rng.value / 100; previewShare(s => { s.shade = sh; }); val.textContent = rng.value + '%'; ovQueuePreview(); });
+  bar.appendChild(lab);
+  const vis = mk('Off = facets are opaque: only what is visible from this photo is shown (lines, points and labels behind facets are hidden)', () => { const v = !st.occlude; previewShare(s => { s.occlude = v; }); paintVis(); ovQueuePreview(); });
+  const paintVis = () => { vis.textContent = 'Transparency: ' + (st.occlude ? 'off' : 'on'); };
+  paintVis();
+  mk('', () => { resetLightboxZoom(); }).textContent = 'Reset view';
+  const sep = document.createElement('span'); sep.className = 'view3d-sep'; sep.setAttribute('aria-hidden', 'true'); bar.appendChild(sep);
+  const pts = mk('', () => { const v = !st.pts; previewShare(s => { s.pts = v; }); paintPts(); ovQueuePreview(); });
+  const paintPts = () => { pts.textContent = 'Points: ' + (st.pts ? 'on' : 'off'); };
+  paintPts();
+  const lbl = mk('', () => { const v = !st.labels; previewShare(s => { s.labels = v; }); paintLbl(); ovQueuePreview(); });
+  const paintLbl = () => { lbl.textContent = 'Pitch: ' + (st.labels ? 'on' : 'off'); };
+  paintLbl();
+  const types = new Set();
+  (g.geo.S || []).forEach(s => (s[3] || []).forEach(t => types.add(t)));
+  (g.geo.F || []).forEach(f => types.add(f.t || 0));
+  VIEW3D_FLAGS.forEach(([name, bit]) => {
+    if (![...types].some(t => t & bit)) return;
+    const b = mk('Show/hide ' + name + ' facets', () => { previewShareHide(bit, (st.hide & bit) === 0); paint(); ovQueuePreview(); });
+    b.classList.add('view3d-flag');
+    const paint = () => { const off = (st.hide & bit) !== 0; b.textContent = name + ': ' + (off ? 'off' : 'on'); b.classList.toggle('off', off); };
+    paint();
+  });
+  bar.style.display = '';
+}
 /* ── DOMContentLoaded ── */
 document.addEventListener('DOMContentLoaded', () => {
   const savedTab = localStorage.getItem('parActiveTab');
@@ -1968,20 +2406,66 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.target.id === 'reportDetailOverlay') closeReportDetailModal();
   });
 document.querySelector('.detail-modal')?.addEventListener('click', e => {
+    if (e.target.closest('.detail-view3d-thumb')) { const v3 = wireframeStates.view3d; if (v3 && v3.status === 'ready' && v3.src) openImageLightbox(v3.src); return; }
     const img = e.target.closest('.detail-image-thumb img');
-    if (img && img.getAttribute('src')) openImageLightbox(img.getAttribute('src'));
+    if (img && img.getAttribute('src')) openImageLightbox(img.getAttribute('src'), img);
 });
   document.querySelectorAll('.detail-tab').forEach(tab => {
     tab.addEventListener('click', () => switchDetailTab(tab.dataset.tab));
   });
   document.getElementById('imageLightboxClose')?.addEventListener('click', closeImageLightbox);
+  wireView3dViewer();
+  (function wireLightboxZoom(){
+    const lbEl  = document.getElementById('imageLightbox');
+    const imgEl = document.getElementById('imageLightboxImg');
+    if (!lbEl || !imgEl) return;
+    imgEl.draggable = false;
+    lbEl.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });   // no Refresh menu on right-click in the image preview
+    lbEl.addEventListener('wheel', e => {
+      if (!lbEl.classList.contains('open')) return;
+      e.preventDefault();
+      zoomLightboxAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+    }, { passive: false });
+    let drag = null;
+    imgEl.addEventListener('mousedown', e => {
+      if (lbZoom.s <= 1 || e.button !== 0) return;
+      e.preventDefault();
+      drag = { sx: e.clientX, sy: e.clientY, ox: lbZoom.x, oy: lbZoom.y };
+      lightboxDragged = false;
+      imgEl.classList.add('dragging');
+    });
+    document.addEventListener('mousemove', e => {
+      if (!drag) return;
+      const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 3) lightboxDragged = true;
+      lbZoom.x = drag.ox + dx; lbZoom.y = drag.oy + dy;
+      applyLightboxZoom();
+    });
+    document.addEventListener('mouseup', () => {
+      if (!drag) return;
+      drag = null;
+      imgEl.classList.remove('dragging');
+      setTimeout(() => { lightboxDragged = false; }, 0);   // swallow the click that ends a drag
+    });
+    imgEl.addEventListener('dblclick', resetLightboxZoom);
+  })();
+  document.getElementById('imageLightboxPrev')?.addEventListener('click', () => stepImageLightbox(-1));
+  document.getElementById('imageLightboxNext')?.addEventListener('click', () => stepImageLightbox(1));
   document.getElementById('imageLightbox')?.addEventListener('click', e => {
-    if (e.target.id === 'imageLightbox') closeImageLightbox();
+    if (e.target.id === 'imageLightbox' && !lightboxDragged) closeImageLightbox();
   });
   document.addEventListener('keydown', e => {
-    if (e.key !== 'Escape') return;
     const lb = document.getElementById('imageLightbox');
-    if (lb && lb.classList.contains('open')) closeImageLightbox();
+    const lightboxOpen = !!(lb && lb.classList.contains('open'));
+    // With an image open in the preview, Left/Right step to the previous/next image.
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      if (lightboxOpen) { e.preventDefault(); stepImageLightbox(e.key === 'ArrowRight' ? 1 : -1); }
+      return;
+    }
+    if (e.key !== 'Escape') return;
+    const v3 = document.getElementById('view3dViewer');
+    if (v3 && v3.classList.contains('open')) { closeView3dViewer(); return; }
+    if (lightboxOpen) closeImageLightbox();
     else closeReportDetailModal();
   });
 });
@@ -2452,6 +2936,7 @@ function openReportDetailModal(details){
   const title   = document.getElementById('detailModalTitle');
   const sub     = document.getElementById('detailModalSubtitle');
   if (!overlay || !body) return;
+  parLog('info', `Report #${details.reportID} opened (${details.source || '?'}, ${details.appLabel || '?'}, ${details.stateLabel || '?'})`);
   const typeLabel = details.isTraining ? 'Training' : 'Live';
   title.innerHTML = `Report #${details.reportID}`;
   sub.innerHTML = `<div id="detailFolderName" class="detail-folder-name"></div>`;
@@ -2604,7 +3089,11 @@ function openReportDetailModal(details){
   }
   const imagesGrid = document.getElementById('detailImagesGrid');
   const imagesStatus = document.getElementById('detailImagesStatus');
+  resetWireframe();
+  if (isTwisterFileInfo) markWireframePending();
+  reportNoWireframe = !!isHipster;   // Hipster: skip wireframe generation (no placeholder / error tiles)
   if (imagesGrid) imagesGrid.innerHTML = buildImageSkeletons();
+  if (isTwisterFileInfo) renderWireframeThumb();
   if (imagesStatus) imagesStatus.textContent = 'Searching…';
   switchDetailTab('overview');
   // Size the modal to fit the Overview tab's content with no internal
@@ -2847,7 +3336,9 @@ async function copyTextToClipboard(text){
     if (e.key === 'Escape') closeMenu();
   });
 })();
-function buildImageSkeletons(count = 5){
+function buildImageSkeletons(count = 4){
+  // Same layout as the loaded grid: 4 photo slots (N/E/W/S). The Ortho and 3D Wireframe
+  // placeholders are inserted in front of them by renderWireframeThumb().
   return Array.from({ length: count }).map(() => `<div class="detail-image-thumb detail-image-skel"></div>`).join('');
 }
 function getEvmBaseName(filePath){
@@ -2856,8 +3347,143 @@ function getEvmBaseName(filePath){
   const fileName = parts[parts.length - 1] || '';
   return fileName.replace(/\.evm$/i, '');
 }
+/* Generated roof wireframe (top-down, from the latest rollback .evm). It is
+   rendered as the first tile of the Images grid. Because loadReportImages()
+   rewrites the grid, the tile is driven by wireframeState and re-applied
+   after every grid rewrite, so the order the two requests finish in
+   doesn't matter. */
+function resetWireframe(){
+  wireframeToken++;
+  Object.keys(ovCache).forEach(k => delete ovCache[k]);
+  Object.keys(ovStates).forEach(k => delete ovStates[k]);
+  stopTileSpin();
+  reportTopDownSrc = '';   // never show the previous report's top-down photo while the new report's images load
+  reportImagesDone = false;
+  hideOvToolbar();
+  Object.assign(view3dState, { hide: VIEW3D_DEFAULT_HIDE, shade: 0, occlude: false, pts: false, labels: true });   // shared preview settings back to defaults
+  Object.keys(WF_TILES).forEach(kind => {
+    const st = wireframeStates[kind];
+    if (st && st.src) { try { URL.revokeObjectURL(st.src); } catch {} }
+    wireframeStates[kind] = { status: 'idle', src: null, error: '', detail: '' };
+    const el = document.getElementById(WF_TILES[kind].id);
+    if (el) el.remove();
+  });
+}
+// Twister reports: show Ortho / 3D Wireframe placeholder boxes right away (before the EVM is located).
+function markWireframePending(){
+  Object.keys(WF_TILES).forEach(kind => { wireframeStates[kind] = { status: 'pending', src: null, error: '', detail: '' }; });
+}
+function setWireframeUnavailable(reason){
+  Object.keys(WF_TILES).forEach(kind => {
+    wireframeStates[kind] = { status: 'error', src: null, error: reason, detail: '' };
+  });
+}
+// If the EVM can't be found, turn any still-pending placeholder into an "unavailable" tile.
+function settleWireframe(reason){
+  let changed = false;
+  Object.keys(WF_TILES).forEach(kind => {
+    const st = wireframeStates[kind];
+    if (st && st.status === 'pending') {
+      wireframeStates[kind] = { status: 'error', src: null, error: reason || 'No EVM file found', detail: '' };
+      changed = true;
+    }
+  });
+  if (changed) renderWireframeThumb();
+}
+function renderWireframeThumb(){
+  const grid = document.getElementById('detailImagesGrid');
+  if (!grid) return;
+  // Hipster: the Ortho photo and the non-clickable 3D Wireframe placeholder are built by loadReportImages; don't touch them here
+  // (the idle-state cleanup below would remove the placeholder).
+  if (reportNoWireframe) { lockModalHeightToOverview(); return; }
+  // Order: Ortho, 3D Wireframe, then the photos (the top-down photo is not shown as a tile).
+  let prev = null;
+  Object.keys(WF_TILES).forEach(kind => {
+    const cfg = WF_TILES[kind];
+    const st = wireframeStates[kind] || { status: 'idle' };
+    let el = document.getElementById(cfg.id);
+    if (st.status === 'idle') { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = cfg.id; }
+    grid.insertBefore(el, prev ? prev.nextSibling : grid.firstChild);
+    prev = el;
+    if (kind === 'overlay' && st.status !== 'ready' && reportTopDownSrc) {
+      // Ortho: show the plain top-down photo right away; the wireframe overlay is generated in the
+      // background and replaces it when ready (or the photo simply stays if generation fails).
+      el.className = 'detail-image-thumb detail-feature-thumb detail-ortho-plain-img';
+      el.title = cfg.label;
+      el.innerHTML = `<img src="${reportTopDownSrc}" alt="${cfg.label}"><span class="detail-wireframe-badge">${cfg.label}</span>`;
+    } else if (st.status === 'loading' || st.status === 'pending') {
+      el.className = 'detail-image-thumb detail-feature-thumb detail-image-skel';
+      el.title = cfg.loading;
+      el.innerHTML = `<span class="detail-wireframe-badge">${cfg.label}</span><span class="detail-wireframe-loading-status" role="status" aria-live="polite">${cfg.loading}</span>`;
+    } else if (st.status === 'error') {
+      el.className = 'detail-image-thumb detail-feature-thumb detail-wireframe-error';
+      el.title = st.detail || st.error || (cfg.label + ' unavailable');
+      const reason = String(st.error || '');
+      el.innerHTML = `<div><div>${cfg.label} unavailable</div><div class="detail-wireframe-reason">${escapeHtml(reason.length > 90 ? reason.slice(0, 90) + '…' : reason)}</div></div>`;
+    } else {
+      el.className = `detail-image-thumb detail-feature-thumb wf-ready ${cfg.cls}`;
+      el.title = kind === 'view3d' ? '3D Wireframe - click to open and rotate' : cfg.label;
+      el.innerHTML = `<img src="${st.src}"${kind === 'overlay' ? ' data-ov-key="O"' : ''} alt="${cfg.label}"><span class="detail-wireframe-badge">${cfg.label}</span>`;
+      if (kind === 'view3d' && st.geo) startTileSpin(el, st.geo);   // live rotating tile
+    }
+  });
+  buildOverlayComposites();
+  applyPhotoWireframes();
+  lockModalHeightToOverview();
+}
+function startWireframe(evmPath){
+  if (!evmPath) return;
+  const myToken = ++wireframeToken;
+  Object.keys(ovCache).forEach(k => delete ovCache[k]);
+  Object.keys(WF_TILES).forEach(kind => {
+    const old = wireframeStates[kind];
+    if (old && old.src) { try { URL.revokeObjectURL(old.src); } catch {} }
+    wireframeStates[kind] = { status: 'loading', src: null, error: '', detail: '' };
+  });
+  renderWireframeThumb();
+  Object.keys(WF_TILES).forEach(kind => {
+    if (kind === 'overlay') return;   // Ortho is drawn in the browser from the 3D geometry (see buildOverlayComposites)
+    fetch(`/api/wireframe?evm=${encodeURIComponent(evmPath)}${WF_TILES[kind].query}`)
+      .then(r => {
+        const type = r.headers.get('content-type') || '';
+        if (r.ok && type.startsWith('image/')) return r.blob().then(b => ({ blob: b }));
+        if (r.ok && kind === 'view3d' && type.includes('json')) return r.json().then(g => ({ geo: g }));
+        return r.json().catch(() => ({})).then(j => ({
+          error: (j && (j.error || j.message)) || `HTTP ${r.status}`,
+          detail: (j && j.detail) || '',
+          code: (j && j.code) || ''
+        }));
+      })
+      .then(res => {
+        if (myToken !== wireframeToken) return;
+        if (res.blob) wireframeStates[kind] = { status: 'ready', src: URL.createObjectURL(res.blob), error: '', detail: '' };
+        else if (res.geo) {
+          let snap = '';
+          try { snap = render3dSnapshot(res.geo); } catch {}
+          if (snap && res.geo.P && res.geo.P.length) wireframeStates[kind] = { status: 'ready', src: snap, geo: res.geo, error: '', detail: '' };
+          else wireframeStates[kind] = { status: 'error', src: null, error: 'No 3D geometry in this EVM', detail: '' };
+        }
+        else if (res.code === 'no-topdown') wireframeStates[kind] = { status: 'idle', src: null, error: '', detail: '' };
+        else wireframeStates[kind] = { status: 'error', src: null, error: res.error, detail: res.detail || '' };
+        {
+          const st = wireframeStates[kind];
+          parLog(st.status === 'error' ? 'warn' : (st.status === 'ready' ? 'ok' : 'info'),
+            `${WF_TILES[kind].label}: ${st.status === 'idle' ? 'skipped (no top-down photo)' : st.status}${st.error ? ' - ' + st.error : ''}`);
+        }
+        renderWireframeThumb();
+      })
+      .catch(() => {
+        if (myToken !== wireframeToken) return;
+        wireframeStates[kind] = { status: 'error', src: null, error: "Couldn't reach the local wireframe service.", detail: '' };
+        renderWireframeThumb();
+      });
+  });
+}
 function loadReportImages(reportId, locationName, folderName){
   const myToken = ++imageLoadToken;
+  reportTopDownSrc = '';
+  reportImagesDone = false;
   const grid       = document.getElementById('detailImagesGrid');
   const status     = document.getElementById('detailImagesStatus');
   const folderNameEl = document.getElementById('detailFolderName');
@@ -2871,10 +3497,31 @@ function loadReportImages(reportId, locationName, folderName){
       if (data && data.found && Array.isArray(data.images) && data.images.length) {
         if (status) status.textContent = '';
         if (folderNameEl) folderNameEl.textContent = data.folder || '';
-        grid.innerHTML = data.images.map(src => `
-          <div class="detail-image-thumb">
-            <img src="${src}" alt="Report image" loading="eager" decoding="async" fetchpriority="high" onerror="this.closest('.detail-image-thumb').classList.add('img-error')">
-          </div>`).join('');
+        // The Ortho / 3D Wireframe tiles are inserted first (see renderWireframeThumb), then the photos.
+        // Each photo gets a badge like those tiles: North, East, West, South.
+        const imageLabels = Array.isArray(data.imageLabels) ? data.imageLabels : [];
+        reportTopDownSrc = data.topDown || '';
+        // The top-down (Ortho) photo is not shown as a tile; it is only the base of the Ortho.
+        grid.innerHTML = data.images.map((src, idx) => ({ src, idx })).filter(o => reportNoWireframe || !(data.topDown && o.src === data.topDown)).map(({ src, idx }) => {
+          const isTop = !!(reportNoWireframe && data.topDown && src === data.topDown);   // Hipster: plain Ortho photo tile
+          const label = isTop ? 'Ortho' : (imageLabels[idx] || '');
+          return `
+          <div class="detail-image-thumb${isTop ? ' detail-feature-thumb detail-ortho-plain' : ''}">
+            <img src="${src}"${PHOTO_DIRS[label] ? ` data-dir="${PHOTO_DIRS[label]}"` : ''} alt="${escapeHtml(label || (isTop ? 'Top-down image' : 'Report image'))}" loading="eager" decoding="async" fetchpriority="high" onerror="this.closest('.detail-image-thumb').classList.add('img-error');parLog('warn','Image failed to load: ${escapeHtml(label || 'image')}')">
+            ${label ? `<span class="detail-wireframe-badge">${escapeHtml(label)}</span>` : ''}
+          </div>`;
+        }).join('');
+        if (reportNoWireframe) {
+          // Hipster: no wireframes are generated - the 3D Wireframe tile is a non-clickable placeholder (sits right after the Ortho tile).
+          const ph = document.createElement('div');
+          ph.id = 'detailView3dThumb';
+          ph.className = 'detail-image-thumb detail-feature-thumb detail-wireframe-error detail-view3d-placeholder';
+          ph.style.pointerEvents = 'none';   // not clickable
+          ph.innerHTML = '<span class="detail-wireframe-badge">3D Wireframe</span><div class="ph-title">Hipster</div><div class="ph-sub">3D Wireframe not yet available</div>';
+          const ortho = grid.querySelector('.detail-ortho-plain');
+          grid.insertBefore(ph, ortho ? ortho.nextSibling : grid.firstChild);
+        }
+        parLog('info', `Report ${reportId}: ${data.images.length} image(s) from ${data.folder || 'archive folder'}`);
       } else if (data && data.found) {
         if (status) status.textContent = '';
         if (folderNameEl) folderNameEl.textContent = data.folder || '';
@@ -2884,12 +3531,15 @@ function loadReportImages(reportId, locationName, folderName){
         if (folderNameEl) folderNameEl.textContent = '';
         grid.innerHTML = `<div class="detail-images-empty">${escapeHtml((data && (data.message || data.error)) || 'No matching report folder found.')}</div>`;
       }
+      reportImagesDone = true;
+      renderWireframeThumb();
       lockModalHeightToOverview();
     })
     .catch(() => {
       if (myToken !== imageLoadToken) return;
       if (status) status.textContent = '';
       grid.innerHTML = `<div class="detail-images-empty">Couldn't reach the archive share. Check your network/VPN connection.</div>`;
+      renderWireframeThumb();
       lockModalHeightToOverview();
     });
 }
@@ -2938,6 +3588,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     const message = (isQc ? 'QC ID' : 'Tech ID') + ' or team not available for this report yet.';
     setFields(message, true);
     if (hasReworkCount) setValue(notesEl, message, true);
+    settleWireframe(message);
     loadReportImages(reportId, locationName);
     return;
   }
@@ -2955,6 +3606,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
     .then(data => {
       if (myToken !== fileInfoLoadToken) return;
       if (data && data.found) {
+        parLog('ok', `EVM data for ${reportId}: rollback ${data.rollback || '?'}${data.cached ? ' (cached)' : ''}`);
         let parsed = null;
         try { parsed = JSON.parse(data.output || '{}'); } catch { parsed = null; }
         if (parsed) {
@@ -2990,12 +3642,14 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
         // Twister's .evm filename (minus extension) is the exact archive
         // folder name, so go straight there instead of scanning the share.
         const evmBaseName = getEvmBaseName(data.filePath);
+        startWireframe(data.filePath);
         loadReportImages(reportId, locationName, evmBaseName);
       } else {
         // "No rollback found" isn't useful on its own — show the short
         // two-level box path (e.g. "2027JHTCT79\InProgress") instead so the
         // person can see exactly where the .evm was expected to be.
         const shortPath = data && data.searchedPath;
+        parLog('warn', `EVM data for ${reportId}: ${(data && (data.searchedPath || data.message || data.error)) || 'not available'}`);
         const notFoundMessage = shortPath
           ? `EVM not found in ${shortPath}`
           : ((data && (data.message || data.error)) || 'File info not available.');
@@ -3003,6 +3657,7 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
           ? `EVM not found in ${shortenPathForNotes(shortPath)}`
           : notFoundMessage;
         setFields(notFoundMessage, true);
+        settleWireframe(notFoundMessage);
         if (hasReworkCount) setValue(notesEl, notesNotFoundMessage, true);
         // No filename to go on — fall back to the archive search by report ID.
         loadReportImages(reportId, locationName);
@@ -3012,25 +3667,420 @@ function loadFileInfo(reportId, techUsername, teamNumber, locationName, stateLab
       if (myToken !== fileInfoLoadToken) return;
       const message = "Couldn't reach the local file-info service.";
       setFields(message, true);
+      settleWireframe(message);
       if (hasReworkCount) setValue(notesEl, message, true);
       loadReportImages(reportId, locationName);
     });
 }
-function openImageLightbox(src){
+/* 3D Wireframe: rotatable wireframe drawn on a canvas from the geometry the server sends
+   ({P: points, S: [i, j, segmentCode], colors, names}). Z is up; drag rotates, wheel zooms. */
+/* Default = top-down, same orientation as the top-down wireframe image (x right, y down). */
+const VIEW3D_DEFAULT = { yaw: 0, pitch: Math.PI / 2, zoom: 1 };
+const VIEW3D_DASHED = new Set(['StepFlashing', 'Rake', 'Valley', 'Hip']);
+/* Facet-type flags the viewer can hide (Facets[].Type bits; a facet like Roof+Object+Hole = 672 is hidden if any of its flags is off). */
+/* 3D view starts with: Auto-rotate off, Floor off, Points off, Shading 0%, Visible only off. */
+const VIEW3D_DEFAULT_HIDE = 2048;   // Floor
+const VIEW3D_FLAGS = [['Hole', 32], ['Obstruction', 64], ['Object', 128], ['External', 256], ['Roof', 512], ['Wall', 1024], ['Floor', 2048], ['Unknown', 4096], ['Surface', 8192], ['Material', 16384]];
+/* Home orientation of the 3D view = the North photo's viewpoint. The camera direction is read from the North photo's
+   projection (geo.V.N rows: photo x, photo y, depth, in the original x/y/z); the viewer's axes are x, -y, -z.
+   Falls back to the top-down default when the report has no North projection. */
+function view3dHomeView(geo){
+  try {
+    const M = geo && geo.V && geo.V.N;
+    if (!M) return { yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch };
+    const nz = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+    const toV = r => [r[0], -r[1], -r[2]];
+    const right = toV(M[0]), up = toV([-M[1][0], -M[1][1], -M[1][2]]);
+    const d0 = nz(toV(M[2]));
+    let best = null;
+    [d0, d0.map(c => -c)].forEach(d => {   // depth may grow away from or towards the camera: keep the one that matches the photo's right / up axes
+      const pitch = Math.asin(Math.max(-1, Math.min(1, -d[2]))), yaw = Math.atan2(d[0], d[1]);
+      const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const score = (cy * right[0] - sy * right[1]) + ((sy * sp) * up[0] + (cy * sp) * up[1] + cp * up[2]);
+      if (!best || score > best.score) best = { yaw, pitch, score };
+    });
+    if (!best || !isFinite(best.yaw) || !isFinite(best.pitch)) throw new Error('bad view');
+    return { yaw: best.yaw, pitch: best.pitch };
+  } catch (e) { return { yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch }; }
+}
+let view3dState = { geo: null, yaw: VIEW3D_DEFAULT.yaw, pitch: VIEW3D_DEFAULT.pitch, zoom: 1, panX: 0, panY: 0, hide: VIEW3D_DEFAULT_HIDE, shade: 0, auto: false, occlude: false, pts: false, labels: true, raf: 0 };
+function view3dNormalize(geo){
+  if (geo._q) return geo._q;
+  const P = geo.P, lo = [0, 1, 2].map(k => Math.min(...P.map(p => p[k]))), hi = [0, 1, 2].map(k => Math.max(...P.map(p => p[k])));
+  const c = lo.map((v, k) => (v + hi[k]) / 2), R = Math.max(...hi.map((v, k) => v - lo[k]), 1e-6) / 2;
+  // y is flipped (image y points down, the viewer's y points away) so the model is drawn un-mirrored with z up:
+  // the camera is then really above the roof, which is what the hidden-surface test relies on.
+  const nrm = p => [(p[0] - c[0]) / R, -(p[1] - c[1]) / R, (p[2] - c[2]) / R];
+  geo._q = P.map(nrm);
+  geo._ql = (geo.F || []).map(f => nrm(f.l));   // pitch label positions, same normalisation
+  return geo._q;
+}
+function drawView3d(ctx, w, h, geo, v, dpr){
+  const custom = v.custom || null;   // photo overlay: custom(p) -> [screen x, screen y, depth] for a raw JSON point
+  const Q = custom ? null : view3dNormalize(geo);
+  const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw), cp = Math.cos(v.pitch), sp = Math.sin(v.pitch);
+  const sc = Math.min(w, h) * 0.42 * v.zoom;
+  const proj = p => {
+    const x = p[0] * cy - p[1] * sy, y = p[0] * sy + p[1] * cy, z = p[2];
+    return [w / 2 + (v.panX || 0) * dpr + x * sc, h / 2 + (v.panY || 0) * dpr - (y * sp + z * cp) * sc, y * cp - z * sp];
+  };
+  const T = custom ? geo.P.map(custom) : Q.map(proj);
+  const hide = v.hide || 0;
+  // A segment stays visible if it has no facet, or any facet using it has none of the hidden flags (shared edges stay).
+  const segVisible = s => { if (!hide) return true; const fts = s[3]; return !fts || !fts.length || fts.some(t => (t & hide) === 0); };
+  // "Visible only": z-buffer of the visible facets (orthographic view, so depth is linear over each planar facet).
+  // Lines, points and labels that lie behind a facet from this viewpoint are dropped. Smaller depth = nearer.
+  let zbuf = null, zw = 0, zh = 0;
+  const ZS = 0.5, ZBIAS = custom ? 2 : 0.02;   // custom: depth is in photo pixels
+  if (v.occlude && geo.A && geo.A.length) {
+    zw = Math.max(2, Math.ceil(w * ZS)); zh = Math.max(2, Math.ceil(h * ZS));
+    zbuf = new Float32Array(zw * zh).fill(Infinity);
+    geo.A.forEach(a => {
+      if (hide && (a[1] & hide)) return;   // facets hidden by a type toggle do not hide anything
+      const ids = a[2], n = ids.length;
+      const X = ids.map(i => T[i][0] * ZS), Y = ids.map(i => T[i][1] * ZS), D = ids.map(i => T[i][2]);
+      let nx = 0, ny = 0, nz = 0;   // plane through the outline (Newell normal in screen x, y, depth)
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        nx += (Y[i] - Y[j]) * (D[i] + D[j]); ny += (D[i] - D[j]) * (X[i] + X[j]); nz += (X[i] - X[j]) * (Y[i] + Y[j]);
+      }
+      if (Math.abs(nz) < 0.5) return;   // edge-on (e.g. a wall seen from the side): covers no pixels
+      const depthAt = (x, y) => D[0] - (nx * (x - X[0]) + ny * (y - Y[0])) / nz;
+      const y0 = Math.max(0, Math.ceil(Math.min(...Y) - 0.5)), y1 = Math.min(zh - 1, Math.floor(Math.max(...Y) - 0.5));
+      for (let y = y0; y <= y1; y++) {
+        const yc = y + 0.5, xs = [];
+        for (let i = 0; i < n; i++) {
+          const j = (i + 1) % n;
+          if ((Y[i] <= yc) !== (Y[j] <= yc)) xs.push(X[i] + (yc - Y[i]) * (X[j] - X[i]) / (Y[j] - Y[i]));
+        }
+        xs.sort((p, q) => p - q);
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+          const xa = Math.max(0, Math.ceil(xs[k] - 0.5)), xb = Math.min(zw - 1, Math.floor(xs[k + 1] - 0.5));
+          for (let x = xa; x <= xb; x++) { const d = depthAt(x + 0.5, yc), idx = y * zw + x; if (d < zbuf[idx]) zbuf[idx] = d; }
+        }
+      }
+    });
+  }
+  // Is a point (screen x, y, depth) in front of everything drawn there? Lenient: compares with the farthest depth in its 3x3 buffer neighbourhood.
+  const visibleAt = (sx, sy, d) => {
+    if (!zbuf) return true;
+    const bx = Math.floor(sx * ZS), by = Math.floor(sy * ZS);
+    let m = -Infinity;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const x = bx + dx, y = by + dy;
+      if (x < 0 || y < 0 || x >= zw || y >= zh) return true;
+      const z = zbuf[y * zw + x]; if (z > m) m = z;
+    }
+    return d <= m + ZBIAS;
+  };
+  if (!custom) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); }
+  ctx.lineCap = 'round'; ctx.lineWidth = 1.8 * dpr;
+  // Material shading: facet outlines filled with their material colour (semi-transparent), far ones first.
+  const sk = v.shade == null ? 1 : +v.shade;   // Shading slider: scales every fill's opacity (0 = off)
+  if (sk > 0 && geo.A && geo.A.length) {
+    const mc = geo.mat || {};
+    // Floor facets (2048) get no shading; Roof (512) and Surface (8192) facets get a tint over the material colour.
+    const polys = geo.A.filter(a => (mc[a[0]] || (a[1] & (32 | 512 | 8192))) && !(a[1] & 2048) && !(hide && (a[1] & hide)))
+      .map(a => ({ a, d: a[2].reduce((sum, i) => sum + T[i][2], 0) / a[2].length }))
+      .sort((p, q) => q.d - p.d);
+    const matAs = geo.matAlphas || {}, roofA = geo.roofAlpha == null ? 0.25 : geo.roofAlpha, surfA = geo.surfAlpha == null ? 0.25 : geo.surfAlpha, holeA = geo.holeAlpha == null ? 0.25 : geo.holeAlpha;
+    const al = x => Math.min(1, x * sk);
+    const path = a => { ctx.beginPath(); a[2].forEach((i, k) => k ? ctx.lineTo(T[i][0], T[i][1]) : ctx.moveTo(T[i][0], T[i][1])); ctx.closePath(); };
+    polys.forEach(({ a }) => {
+      if (mc[a[0]]) { ctx.globalAlpha = al(matAs[a[0]] == null ? 0.25 : matAs[a[0]]); ctx.fillStyle = mc[a[0]]; path(a); ctx.fill(); }
+      if (a[1] & 512) { ctx.globalAlpha = al(roofA); ctx.fillStyle = geo.roof || '#a8f5a8'; path(a); ctx.fill(); }   // Roof tint
+      if (a[1] & 8192) { ctx.globalAlpha = al(surfA); ctx.fillStyle = geo.surf || '#f224e8'; path(a); ctx.fill(); }   // Surface tint
+      if (a[1] & 32) { ctx.globalAlpha = al(holeA); ctx.fillStyle = geo.hole || '#808080'; path(a); ctx.fill(); }   // Hole: gray, on top
+    });
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+  }
+  geo.S.forEach(s => {
+    if (!segVisible(s)) return;
+    let [a, b, code] = s;
+    // Floor outline (a segment of a visible Floor facet, flag 2048): gray dotted, like unspecified lines.
+    const isFloor = !(hide & 2048) && (s[3] || []).some(t => (t & 2048) !== 0);
+    if (isFloor) code = 0;
+    // Hole outline (a segment of a visible Hole facet, flag 32): dotted yellow.
+    const isHole = !isFloor && !(hide & 32) && (s[3] || []).some(t => (t & 32) !== 0);
+    const depth = custom ? 0 : (T[a][2] + T[b][2]) / 2;
+    const name = (geo.names || {})[code];
+    ctx.strokeStyle = isHole ? '#FFD400' : ((geo.colors || {})[code] || '#808080');   // Hole lines: yellow (the Hole fill tint stays gray)
+    ctx.globalAlpha = Math.max(0.35, Math.min(1, (code === 0 ? 0.6 : 1) - 0.25 * depth));
+    ctx.setLineDash((code === 0 || isHole) ? [2 * dpr, 3 * dpr] : (VIEW3D_DASHED.has(name) ? [6 * dpr, 4 * dpr] : []));   // unspecified and Hole lines: dotted
+    if (zbuf) {   // draw only the stretches of the line that are not hidden behind a facet
+      const x0 = T[a][0], y0 = T[a][1], x1 = T[b][0], y1 = T[b][1], d0 = T[a][2], d1 = T[b][2];
+      const n = Math.max(2, Math.min(240, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 3)));
+      let inRun = false;
+      ctx.beginPath();
+      for (let k = 0; k <= n; k++) {
+        const t = k / n, sx = x0 + (x1 - x0) * t, sy = y0 + (y1 - y0) * t;
+        if (visibleAt(sx, sy, d0 + (d1 - d0) * t)) { if (inRun) ctx.lineTo(sx, sy); else { ctx.moveTo(sx, sy); inRun = true; } }
+        else inRun = false;
+      }
+      ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.moveTo(T[a][0], T[a][1]); ctx.lineTo(T[b][0], T[b][1]); ctx.stroke();
+    }
+  });
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+  let ptShown = null;
+  if (hide) { ptShown = new Set(); geo.S.forEach(s => { if (segVisible(s)) { ptShown.add(s[0]); ptShown.add(s[1]); } }); }
+  if (v.pts) { ctx.fillStyle = '#0a4d8c'; T.forEach((t, i) => { if (ptShown && !ptShown.has(i)) return; if (zbuf && !visibleAt(t[0], t[1], t[2])) return; ctx.beginPath(); ctx.arc(t[0], t[1], 2.4 * dpr, 0, 6.2832); ctx.fill(); }); }
+  if (v.labels && (custom ? (geo.F && geo.F.length) : (geo._ql && geo._ql.length))) {
+    // Pitch label on each finite-pitch facet (none for infinite pitch, none for Holes); a white halo keeps it readable over the lines.
+    ctx.font = 'bold ' + Math.round(Math.max(10, Math.min(24, 12 * v.zoom)) * dpr) + 'px Arial, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 3.5 * dpr; ctx.strokeStyle = '#fff'; ctx.fillStyle = '#0a4d8c';
+    (custom ? geo.F.map(f => f.l) : geo._ql).forEach((p, i) => { if ((geo.F[i].t & 32) || parseFloat(geo.F[i].p) > 900 || (hide && (geo.F[i].t & hide))) return; const t = custom ? custom(p) : proj(p);   // no pitch on Holes
+       if (zbuf && !visibleAt(t[0], t[1], t[2])) return; ctx.strokeText(geo.F[i].p, t[0], t[1]); ctx.fillText(geo.F[i].p, t[0], t[1]); });
+  }
+}
+// Small still of the default view, used as the tile image.
+function render3dSnapshot(geo){
+  const cv = document.createElement('canvas');
+  cv.width = 800; cv.height = 600;
+  const hv = view3dHomeView(geo);
+  drawView3d(cv.getContext('2d'), cv.width, cv.height, geo, { yaw: hv.yaw, pitch: hv.pitch, zoom: 1, pts: false, labels: true, hide: VIEW3D_DEFAULT_HIDE, shade: 0 }, 1.5);
+  return cv.toDataURL('image/png');
+}
+/* The 3D Wireframe tile rotates live (same start view as the viewer). The snapshot <img> stays in the tile (it is the preview's
+   image and the fallback) and a canvas is drawn over it. The animation pauses while the mouse is over the tile, while a preview is
+   open, while the tab is hidden, and is skipped for reduced-motion users. */
+const tileSpin = { raf: 0, geo: null, yaw: 0 };
+function stopTileSpin(){ if (tileSpin.raf) cancelAnimationFrame(tileSpin.raf); tileSpin.raf = 0; tileSpin.geo = null; }
+function startTileSpin(el, geo){
+  if (!el || !geo || (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+  const img = el.querySelector('img');
+  if (!img) return;
+  if (tileSpin.raf) cancelAnimationFrame(tileSpin.raf);
+  const hv = view3dHomeView(geo);
+  if (tileSpin.geo !== geo) { tileSpin.geo = geo; tileSpin.yaw = hv.yaw; }   // keeps the angle when the tile is re-rendered
+  const cv = document.createElement('canvas');
+  cv.className = 'tile-spin';
+  img.after(cv);
+  let last = 0, shown = false;
+  const frame = ts => {
+    if (!cv.isConnected || tileSpin.geo !== geo) return;   // tile replaced or report changed
+    tileSpin.raf = requestAnimationFrame(frame);
+    if (ts - last < 40) return;   // ~25 fps
+    const dt = last ? Math.min(0.1, (ts - last) / 1000) : 0;
+    last = ts;
+    const lb = document.getElementById('imageLightbox');
+    if (document.hidden || (lb && lb.classList.contains('open')) || !el.offsetParent || (shown && el.matches(':hover'))) return;
+    tileSpin.yaw += 0.35 * dt;
+    const dpr = window.devicePixelRatio || 1, w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
+    if (!w || !h) return;
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    drawView3d(ctx, w, h, geo, { yaw: tileSpin.yaw, pitch: hv.pitch, zoom: 1, pts: false, labels: true, hide: VIEW3D_DEFAULT_HIDE, shade: 0 }, 1.5 * w / 800);
+    if (!shown) { shown = true; img.style.visibility = 'hidden'; }   // the still stays in the DOM (preview image) but is not shown
+  };
+  tileSpin.raf = requestAnimationFrame(frame);
+}
+function view3dRedraw(){
+  const cv = document.getElementById('view3dCanvas');
+  if (!cv || !view3dState.geo) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  drawView3d(cv.getContext('2d'), w, h, view3dState.geo, view3dState, dpr);
+}
+function view3dLoop(){
+  const st = view3dState;
+  if (st.auto) { st.yaw += 0.006; view3dRedraw(); }
+  st.raf = requestAnimationFrame(view3dLoop);
+}
+// One on/off button per facet-type flag that occurs in this model, placed before "Reset view".
+function view3dBuildFlagButtons(geo){
+  const bar = document.querySelector('.view3d-toolbar');
+  if (!bar) return;
+  bar.querySelectorAll('.view3d-flag').forEach(b => b.remove());
+  const types = new Set();
+  (geo.S || []).forEach(s => (s[3] || []).forEach(t => types.add(t)));
+  (geo.F || []).forEach(f => types.add(f.t || 0));
+  VIEW3D_FLAGS.forEach(([name, bit]) => {
+    if (![...types].some(t => t & bit)) return;
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'view3d-flag'; b.title = 'Show/hide ' + name + ' facets';
+    const paint = () => { const off = (view3dState.hide & bit) !== 0; b.textContent = name + ': ' + (off ? 'off' : 'on'); b.classList.toggle('off', off); };
+    paint();
+    b.addEventListener('click', () => { previewShareHide(bit, (view3dState.hide & bit) === 0); paint(); view3dRedraw(); });
+    bar.appendChild(b);
+  });
+}
+function openView3dViewer(){
+  const st = wireframeStates.view3d;
+  const el = document.getElementById('view3dViewer');
+  if (!el || !st || st.status !== 'ready' || !st.geo) return;
+  // Points / Transparency / Pitch / Shading / facet on-off are shared with the photo previews, so they are kept (reset per report).
+  const hv = view3dHomeView(st.geo);
+  Object.assign(view3dState, { geo: st.geo, yaw: hv.yaw, pitch: hv.pitch, zoom: 1, panX: 0, panY: 0, auto: true });   // starts from the North photo's view, auto-rotating
+  document.getElementById('view3dSpin').textContent = 'Auto-rotate: on';
+  document.getElementById('view3dVis').textContent = 'Transparency: ' + (view3dState.occlude ? 'off' : 'on');
+  document.getElementById('view3dPts').textContent = 'Points: ' + (view3dState.pts ? 'on' : 'off');
+  document.getElementById('view3dLbl').textContent = 'Pitch: ' + (view3dState.labels ? 'on' : 'off');
+  { const sl = document.getElementById('view3dShade'), sv = document.getElementById('view3dShadeVal'), pc = Math.round(view3dState.shade * 100); if (sl) sl.value = pc; if (sv) sv.textContent = pc + '%'; }
+  view3dBuildFlagButtons(st.geo);
+  el.classList.add('open'); el.setAttribute('aria-hidden', 'false');
+  view3dRedraw();
+  if (!view3dState.raf) view3dLoop();
+  parLog('info', `3D Wireframe opened (${st.geo.P.length} points, ${st.geo.S.length} segments)`);
+}
+function closeView3dViewer(){ hideView3dViewer(); closeImageLightbox(); }
+function hideView3dViewer(){
+  const el = document.getElementById('view3dViewer');
+  if (!el) return;
+  el.classList.remove('open'); el.setAttribute('aria-hidden', 'true');
+  if (view3dState.raf) { cancelAnimationFrame(view3dState.raf); view3dState.raf = 0; }
+}
+function wireView3dViewer(){
+  const el = document.getElementById('view3dViewer'), cv = document.getElementById('view3dCanvas');
+  if (!el || !cv) return;
+  const st = view3dState, pointers = new Map();
+  let last = null, pinch = 0;
+  document.getElementById('view3dClose')?.addEventListener('click', closeView3dViewer);
+  document.getElementById('view3dPrev')?.addEventListener('click', () => stepImageLightbox(-1));
+  document.getElementById('view3dNext')?.addEventListener('click', () => stepImageLightbox(1));
+  // Right-drag pans here: block the native menu and the page's Refresh menu (stopPropagation keeps it from the document-level handler).
+  el.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+  el.addEventListener('click', e => { if (e.target === el) closeView3dViewer(); });
+  document.getElementById('view3dSpin')?.addEventListener('click', e => { st.auto = !st.auto; e.currentTarget.textContent = 'Auto-rotate: ' + (st.auto ? 'on' : 'off'); });
+  document.getElementById('view3dVis')?.addEventListener('click', e => { const v = !st.occlude; previewShare(s => { s.occlude = v; }); e.currentTarget.textContent = 'Transparency: ' + (st.occlude ? 'off' : 'on'); view3dRedraw(); });
+  document.getElementById('view3dPts')?.addEventListener('click', e => { const v = !st.pts; previewShare(s => { s.pts = v; }); e.currentTarget.textContent = 'Points: ' + (st.pts ? 'on' : 'off'); view3dRedraw(); });
+  document.getElementById('view3dShade')?.addEventListener('input', e => { const sh = e.currentTarget.value / 100; previewShare(s => { s.shade = sh; }); const sv = document.getElementById('view3dShadeVal'); if (sv) sv.textContent = e.currentTarget.value + '%'; view3dRedraw(); });
+  document.getElementById('view3dLbl')?.addEventListener('click', e => { const v = !st.labels; previewShare(s => { s.labels = v; }); e.currentTarget.textContent = 'Pitch: ' + (st.labels ? 'on' : 'off'); view3dRedraw(); });
+  const reset = () => { const hv = view3dHomeView(st.geo); st.yaw = hv.yaw; st.pitch = hv.pitch; st.zoom = 1; st.panX = 0; st.panY = 0; view3dRedraw(); };
+  document.getElementById('view3dReset')?.addEventListener('click', reset);
+  cv.addEventListener('dblclick', reset);
+  let panning = false;   // true while the right mouse button is held
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]); last = [e.clientX, e.clientY]; panning = e.button === 2; cv.classList.add('dragging'); });
+  cv.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      if (pinch) st.zoom = Math.min(8, Math.max(0.3, st.zoom * d / pinch));
+      pinch = d; view3dRedraw(); return;
+    }
+    if (panning) { st.panX += e.clientX - last[0]; st.panY += e.clientY - last[1]; }
+    else {
+      st.yaw += (e.clientX - last[0]) * 0.008;   // left-drag: model follows the mouse
+      st.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, st.pitch + (e.clientY - last[1]) * 0.008));
+    }
+    last = [e.clientX, e.clientY]; view3dRedraw();
+  });
+  const up = e => { pointers.delete(e.pointerId); pinch = 0; last = pointers.size ? [...pointers.values()][0] : null; if (!pointers.size) cv.classList.remove('dragging'); };
+  cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+  cv.addEventListener('wheel', e => { e.preventDefault(); st.zoom = Math.min(8, Math.max(0.3, st.zoom * Math.exp(-e.deltaY * 0.0015))); view3dRedraw(); }, { passive: false });
+  window.addEventListener('resize', () => { if (el.classList.contains('open')) view3dRedraw(); });
+}
+/* Image preview (lightbox). Left/Right arrow keys (or the on-screen < > buttons) step through
+   every visible tile of the Images grid in grid order, wrapping around:
+   Ortho -> North -> East -> West -> South.
+   (The 3D Wireframe tile opens its own rotatable viewer and is not part of this sequence.) */
+let lightboxSrc = '';
+let lightboxIndex = 0;
+function getLightboxItems(){
+  const grid = document.getElementById('detailImagesGrid');
+  if (!grid) return [];
+  return Array.from(grid.querySelectorAll('.detail-image-thumb:not(.img-error) img'))
+    .filter(img => img.getAttribute('src'))
+    .map(img => {
+      const badge = img.parentElement && img.parentElement.querySelector('.detail-wireframe-badge');
+      return { src: img.getAttribute('src'), label: badge ? badge.textContent.trim() : '', is3d: !!img.closest('.detail-view3d-thumb'), ovKey: img.dataset.ovKey || '', node: img };
+    });
+}
+function showLightboxItem(item, index, total){
+  const img = document.getElementById('imageLightboxImg');
+  const cap = document.getElementById('imageLightboxCaption');
+  if (!img || !item) return;
+  lightboxSrc = item.src;
+  lightboxIndex = index;
+  resetLightboxZoom();
+  if (item.is3d) openView3dViewer(); else hideView3dViewer();   // 3D view is shown on top of the preview
+  img.src = item.src;
+  hideOvToolbar();
+  if (item.ovKey && wireframeStates.view3d && wireframeStates.view3d.geo) {   // photo with a wireframe overlay: same buttons as the 3D viewer
+    ovPreviewKey = item.ovKey;
+    buildOvToolbar(item.ovKey);
+    ovRenderPreview();
+  }
+  img.alt = item.label || 'Report image full size';
+  if (cap) {
+    const parts = [];
+    if (item.label) parts.push(item.label);
+    if (total > 1) parts.push(`${index + 1} / ${total}`);
+    cap.textContent = parts.join('  ·  ');
+    cap.style.display = parts.length ? '' : 'none';
+  }
+  if (item.is3d) {
+    const cap3 = document.getElementById('view3dCaption');
+    if (cap3) cap3.textContent = '3D Wireframe  ·  drag to rotate  ·  right-drag to pan  ·  scroll to zoom  ·  double-click to reset' + (total > 1 ? `  ·  ${index + 1} / ${total}` : '');
+  }
+  document.querySelectorAll('.image-lightbox-nav').forEach(b => { b.style.display = total > 1 ? '' : 'none'; });
+}
+function openImageLightbox(src, node){
   const lb  = document.getElementById('imageLightbox');
   const img = document.getElementById('imageLightboxImg');
   if (!lb || !img) return;
-  img.src = src;
+  const items = getLightboxItems();
+  let idx = node ? items.findIndex(it => it.node === node) : -1;
+  if (idx < 0) idx = items.findIndex(it => it.src === src);
+  showLightboxItem(idx >= 0 ? items[idx] : { src: src, label: '' }, Math.max(idx, 0), idx >= 0 ? items.length : 1);
   lb.classList.add('open');
   lb.setAttribute('aria-hidden', 'false');
+  parLog('info', `Preview opened: ${idx >= 0 && items[idx].label ? items[idx].label : 'image'} (${Math.max(idx, 0) + 1}/${items.length || 1})`);
+}
+function stepImageLightbox(delta){
+  const lb = document.getElementById('imageLightbox');
+  if (!lb || !lb.classList.contains('open')) return;
+  const items = getLightboxItems();
+  if (items.length < 2) return;
+  let idx = (items[lightboxIndex] && items[lightboxIndex].src === lightboxSrc) ? lightboxIndex : items.findIndex(it => it.src === lightboxSrc);
+  if (idx < 0) idx = Math.min(lightboxIndex, items.length - 1);
+  idx = (idx + delta + items.length) % items.length;
+  showLightboxItem(items[idx], idx, items.length);
+  parLog('info', `Preview: ${items[idx].label || 'image'} (${idx + 1}/${items.length})`);
+  // Warm the neighbours so the next arrow press is instant.
+  [1, -1].forEach(d => { const n = items[(idx + d + items.length) % items.length]; if (n) { const pre = new Image(); pre.src = n.src; } });
 }
 function closeImageLightbox(){
   const lb = document.getElementById('imageLightbox');
   if (!lb) return;
   lb.classList.remove('open');
   lb.setAttribute('aria-hidden', 'true');
+  hideView3dViewer();
+  hideOvToolbar();
+  lightboxSrc = '';
+  resetLightboxZoom();
   const img = document.getElementById('imageLightboxImg');
   if (img) img.src = '';
+}
+/* Mouse wheel zooms the preview toward the cursor (1x-8x); drag pans while zoomed; double-click resets. */
+let lbZoom = { s: 1, x: 0, y: 0 };
+let lightboxDragged = false;
+function applyLightboxZoom(){
+  const img = document.getElementById('imageLightboxImg');
+  if (!img) return;
+  img.style.transform = (lbZoom.s === 1 && !lbZoom.x && !lbZoom.y) ? '' : `translate(${lbZoom.x}px, ${lbZoom.y}px) scale(${lbZoom.s})`;
+  img.classList.toggle('zoomed', lbZoom.s > 1);
+}
+function resetLightboxZoom(){ lbZoom = { s: 1, x: 0, y: 0 }; applyLightboxZoom(); }
+function zoomLightboxAt(clientX, clientY, factor){
+  const lb = document.getElementById('imageLightbox');
+  if (!lb) return;
+  const r  = lb.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;   // the image is centred in the lightbox
+  const s0 = lbZoom.s;
+  const s1 = Math.min(8, Math.max(1, s0 * factor));
+  if (s1 === s0) return;
+  if (s1 === 1) lbZoom = { s: 1, x: 0, y: 0 };
+  else {
+    const k = s1 / s0;
+    lbZoom = { s: s1, x: (clientX - cx) - k * (clientX - cx - lbZoom.x), y: (clientY - cy) - k * (clientY - cy - lbZoom.y) };
+  }
+  applyLightboxZoom();
 }
 function closeReportDetailModal(){
   const overlay = document.getElementById('reportDetailOverlay');
@@ -3040,6 +4090,7 @@ function closeReportDetailModal(){
   closeImageLightbox();
   imageLoadToken++;
   fileInfoLoadToken++;
+  resetWireframe();
   document.querySelectorAll('tr.row-detail-active').forEach(row => row.classList.remove('row-detail-active'));
 }
 /* ============================================================================
@@ -3901,19 +4952,15 @@ let q_pendingFetches=0, q_fileCount=0;
 # whatever the tool itself does. Same fix as the WebView2 SDK below: fetch
 # once, cache locally, and only re-copy if the share's copy is newer.
 function Get-FileInfoExeLocal {
+    # TEMP: now resolves fileinfo.py (run through Python) instead of fileinfo.exe.
+    # Variable/function names are unchanged so it is easy to switch back later.
     $cacheDir   = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
-    $localExe   = Join-Path $cacheDir 'fileinfo.exe'
-    $remoteBase = 'P:\1_Coordinators\PIA\fileinfo'
-    $remoteExe  =
-        if (Test-Path -LiteralPath "$remoteBase.exe" -PathType Leaf) { "$remoteBase.exe" }
-        elseif (Test-Path -LiteralPath $remoteBase -PathType Leaf) { $remoteBase }
-        else { $null }
-    if (-not $remoteExe) {
-        # Share unreachable / tool missing — fall back to any already-cached
-        # local copy rather than failing outright.
-        if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
-        return $null
-    }
+    $localExe   = Join-Path $cacheDir 'fileinfo.py'
+    # Only location: PAR\Files\fileinfo.py (no fallback to other folders).
+    $cand = Join-Path $ParFilesDir 'fileinfo.py'
+    $remoteExe = if (Test-Path -LiteralPath $cand -PathType Leaf) { $cand } else { $null }
+    # Script missing / share unreachable => not available (no cached fallback).
+    if (-not $remoteExe) { return $null }
     try {
         $needsCopy = (-not (Test-Path -LiteralPath $localExe -PathType Leaf)) -or
                      ((Get-Item -LiteralPath $remoteExe).LastWriteTime -gt (Get-Item -LiteralPath $localExe).LastWriteTime)
@@ -3923,9 +4970,105 @@ function Get-FileInfoExeLocal {
         }
     }
     catch {
-        # Copy failed (offline, permissions, etc.) — use whatever's cached, if anything.
+        return $null   # copy failed (offline, permissions, etc.) - no fallback
     }
     if (Test-Path -LiteralPath $localExe -PathType Leaf) { return $localExe }
+    return $null
+}
+# Finds a working Python interpreter for fileinfo.py. Candidates come from PATH,
+# the py launcher, and common per-user / system install folders. Each candidate
+# is actually run: it must start and be able to import scipy + numpy. If none
+# have the packages, the first one that merely runs is returned (the error from
+# the missing package then shows up in the File Info output instead of a
+# generic "Python not found"). Microsoft Store stubs fail the run test and are
+# skipped automatically; a real Store-installed Python is accepted.
+function Get-PythonExeLocal {
+    # Native stderr (warnings, Store-stub messages) must not become terminating
+    # errors here, even though the script-level preference is 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    # 1) Shared portable Python on the PIA share (PythonPath in config.json):
+    #    same interpreter + package versions for everyone, nothing to install
+    #    per machine. Used only if it runs and has scipy/numpy/matplotlib.
+    $script:PythonIsShared = $false
+    $shared = $ParConfig.PythonPath
+    if ($shared) {
+        if (Test-Path -LiteralPath $shared -PathType Leaf) {
+            try {
+                $out = (& $shared -c "import scipy, numpy, matplotlib; print('PAR_OK')" 2>&1 | Out-String)
+                if ($LASTEXITCODE -eq 0 -and $out -match 'PAR_OK') { $script:PythonIsShared = $true; return $shared }
+                Write-ParLog "shared python found but failed its package check - falling back to local Python. $($out.Trim())" 'WARN' 'startup'
+            }
+            catch { Write-ParLog "shared python could not be run - falling back to local Python. $($_.Exception.Message)" 'WARN' 'startup' }
+        }
+        else { Write-ParLog "shared python not found ($shared) - falling back to local Python" 'WARN' 'startup' }
+    }
+    # 2) Fall back to any locally installed Python.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($name in 'python', 'python3', 'py') {
+        foreach ($cmd in @(Get-Command $name -CommandType Application -ErrorAction SilentlyContinue)) {
+            if ($cmd.Source) { $candidates.Add($cmd.Source) }
+        }
+    }
+    $globs = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python3*\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\python3.exe'),
+        (Join-Path $env:ProgramFiles 'Python3*\python.exe'),
+        'C:\Python3*\python.exe',
+        'C:\ProgramData\anaconda3\python.exe',
+        'C:\ProgramData\miniconda3\python.exe',
+        (Join-Path $env:USERPROFILE 'anaconda3\python.exe'),
+        (Join-Path $env:USERPROFILE 'miniconda3\python.exe'),
+        (Join-Path $env:WINDIR 'py.exe')
+    )
+    foreach ($g in $globs) {
+        foreach ($f in @(Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+            $candidates.Add($f.FullName)
+        }
+    }
+    # Preference order: scipy+numpy+matplotlib (fileinfo + wireframe both work)
+    # > scipy+numpy (fileinfo only) > any Python 3 that runs.
+    $noMpl = $null
+    $firstRunnable = $null
+    foreach ($exe in ($candidates | Select-Object -Unique)) {
+        try {
+            $out = (& $exe -c "import scipy, numpy, matplotlib; print('PAR_OK')" 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $out -match 'PAR_OK') { return $exe }
+            if (-not $noMpl) {
+                $out = (& $exe -c "import scipy, numpy; print('PAR_OK')" 2>&1 | Out-String)
+                if ($LASTEXITCODE -eq 0 -and $out -match 'PAR_OK') { $noMpl = $exe; continue }
+            }
+            if (-not $firstRunnable) {
+                $ver = (& $exe --version 2>&1 | Out-String)
+                if ($LASTEXITCODE -eq 0 -and $ver -match 'Python 3') { $firstRunnable = $exe }
+            }
+        }
+        catch { }
+    }
+    if ($noMpl) { return $noMpl }
+    return $firstRunnable
+}
+# Same share-to-local-cache idea as Get-FileInfoExeLocal, for any helper script
+# kept in the PAR Files folder (e.g. roof_wireframe.py).
+function Get-PiaScriptLocal {
+    param([Parameter(Mandatory)][string]$FileName)
+    $cacheDir = Join-Path $env:LOCALAPPDATA 'PAR-App\fileinfo'
+    $local    = Join-Path $cacheDir $FileName
+    $remote   = $null
+    foreach ($p in @((Join-Path $ParFilesDir $FileName))) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) { $remote = $p; break }
+    }
+    if (-not $remote) { return $null }   # not in PAR\Files => not available (no cached fallback)
+    try {
+        $needsCopy = (-not (Test-Path -LiteralPath $local -PathType Leaf)) -or
+                     ((Get-Item -LiteralPath $remote).LastWriteTime -gt (Get-Item -LiteralPath $local).LastWriteTime)
+        if ($needsCopy) {
+            New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+            Copy-Item -LiteralPath $remote -Destination $local -Force
+        }
+    }
+    catch { return $null }
+    if (Test-Path -LiteralPath $local -PathType Leaf) { return $local }
     return $null
 }
 # ============================================================================
@@ -4022,11 +5165,13 @@ try {
     $listener.Start()
 }
 catch {
+    Write-ParLog "Couldn't start the local server on ${prefix}: $($_.Exception.Message)" 'ERROR' 'server'
     [System.Windows.MessageBox]::Show(
         "Couldn't start the local server on ${prefix}:`n$($_.Exception.Message)",
         'PAR — startup failed', 'OK', 'Error') | Out-Null
     exit 1
 }
+Write-ParLog "Local server listening on $prefix" 'OK' 'server'
 # Requests are handled by a small pool of runspaces (instead of one runspace
 # processing requests one at a time), so things like "Images" and "File Info"
 # — both fired the instant the detail popup opens — actually run at the same
@@ -4038,6 +5183,598 @@ $FolderCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object
 # pooled request just uses the cached local path instead of re-resolving
 # it — and re-hitting the share — per request.
 $FileInfoExeLocal = Get-FileInfoExeLocal
+$PythonExeLocal   = Get-PythonExeLocal
+if ($FileInfoExeLocal) { Write-ParLog "fileinfo script: $FileInfoExeLocal" 'INFO' 'startup' }
+else { Write-ParLog "fileinfo script NOT found ($ParFilesDir\fileinfo.py) - EVM Data will be unavailable" 'WARN' 'startup' }
+if ($PythonExeLocal) { Write-ParLog "python: $PythonExeLocal$(if ($PythonIsShared) { ' (shared)' } else { ' (local)' })" 'INFO' 'startup' }
+else { Write-ParLog 'Python 3 NOT found - EVM Data and wireframes will be unavailable' 'WARN' 'startup' }
+$WireframePyText = @'
+#!/usr/bin/env python3
+"""Generate a top-down roof wireframe image from an .evm file (a renamed MATLAB .mat file).
+
+Usage:
+    python roof_wireframe.py job.evm
+    python roof_wireframe.py job.evm -o roof.png --no-pitch --dpi 200
+    python roof_wireframe.py job.evm -o overlay.png --overlay O_1234_01.jpg
+    python roof_wireframe.py job.evm -v        # extra (debug) logging
+    python roof_wireframe.py job.evm -q        # warnings/errors only
+    python roof_wireframe.py job.evm --json3d -o job_3d.json   # 3D geometry for the PAR "3D View" tile
+
+Progress is logged to the terminal (stdout) with timestamps.
+
+--json3d writes the 3D geometry (points + typed segments + a pitch label per facet,
+Z reversed so the roof sits upright) as JSON instead of a PNG. Unlike the top-down
+image it keeps the edges of facets with an infinite pitch (but gives them no label); PAR renders it as a rotatable 3D view.
+
+--overlay draws the wireframe on top of the given top-down photo. The model
+units are image pixels (Units == 'pixels', ImageData[0] has a ~identity
+transform), so model x/y are used directly as photo pixel coordinates. If the
+photo was exported at a different resolution than the tool's working image, use
+--scale (e.g. 2 if the photo is twice as large).
+
+Requires: numpy, scipy, matplotlib
+"""
+import argparse
+import json
+import logging
+import sys
+import time
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.io as sio
+from matplotlib.path import Path
+
+log = logging.getLogger("roof_wireframe")
+
+# Edge classification comes from each segment's LegacyUserTypeOverride code
+# (same codes as SegmentLabels.Style). Mapping inferred from the file's geometry.
+SEG_NAMES = {0: "Unspecified", 19: "Parapet", 18: "Flashing", 17: "StepFlashing", 16: "Rake",
+             15: "Eave", 14: "Valley", 13: "Ridge", 12: "Hip", 11: "Other",
+             10: "Hidden", 64: "Inside Corner", 65: "Outside Corner",
+             66: "Obtuse Inside Corner", 67: "Obtuse Outside Corner", 68: "Top Wall", 69: "Bottom Wall",
+             70: "Material Horizontal Boundary", 71: "Material Vertical Boundary",
+             72: "Material Oblique Boundary", 73: "Material Top", 74: "Material Bottom",
+             75: "Material Inside Corner", 76: "Material Outside Corner",
+             77: "Material Obtuse Inside Corner", 78: "Material Obtuse Outside Corner",
+             100: "Isoline"}
+SEG_COLORS = {0: "#808080", 19: "#7a0fe3", 18: "#c88c28", 17: "#a06000", 16: "#1a991a",
+              15: "#000000", 14: "#0000ff", 13: "#ff0000", 12: "#ff00ff",
+              11: "#ff99c7", 10: "#ffff00",   # Hidden
+              64: "#00ffff", 65: "#a80000",   # Inside Corner / Outside Corner
+              66: "#00ff00", 67: "#ff00ff",   # Obtuse Inside Corner / Obtuse Outside Corner
+              68: "#0000cc", 69: "#006666",   # Top Wall / Bottom Wall (wall edges)
+              70: "#00aaee", 71: "#c55500", 72: "#aa00ee",   # Material Horizontal / Vertical / Oblique Boundary
+              73: "#0000cc", 74: "#009944",   # Material Top / Material Bottom
+              75: "#00ffff", 76: "#a80000",   # Material Inside Corner / Outside Corner
+              77: "#00ff00", 78: "#e200aa",   # Material Obtuse Inside Corner / Obtuse Outside Corner
+              100: "#666600"}   # Isoline
+
+# Dashed vs solid per edge type; unspecified gray segments use dotted lines.
+DASHED = {"StepFlashing", "Rake", "Valley", "Hip"}
+
+def line_style(code):
+    if code == UNSPECIFIED_CODE:
+        return ":"
+    return "--" if SEG_NAMES[code] in DASHED else "-"
+UNSPECIFIED_CODE = 0  # no/unrecognised edge type: drawn dotted gray (kept distinct from "Other", code 11)
+
+# Material shading of facets in the 3D view (Facets[].MaterialID -> colour, drawn at MATERIAL_ALPHAS opacity).
+MATERIAL_NAMES = {1: "None", 2: "Siding", 3: "Masonry"}
+MATERIAL_COLORS = {1: "#bfb28c", 2: "#bfbf95", 3: "#70aca2"}
+# Opacity per material (opacity = 1 - transparency): all three are 75% transparent.
+MATERIAL_ALPHAS = {1: 0.25, 2: 0.25, 3: 0.25}
+# Facets with the Roof flag (512) get this tint on top of the material shading.
+ROOF_COLOR = "#a8f5a8"
+ROOF_ALPHA = 0.25  # 75% transparent
+# Hole facets (flag 32): gray lines, plus a gray tint (75% transparent) over the shading.
+HOLE_COLOR = "#808080"
+HOLE_ALPHA = 0.25
+# Floor facets (flag 2048) get no shading and no pitch label.
+FLOOR_FLAG = 2048
+# Facets with the Surface flag (8192) get this tint on top of the material shading.
+SURFACE_COLOR = "#f224e8"
+SURFACE_ALPHA = 0.25  # 75% transparent
+
+# Pitch labels shrink to fit their facet, starting at a compact size.
+PITCH_FONT_MAX = 5.0
+PITCH_FONT_MIN = 1.5
+PITCH_FONT_STEP = 0.25
+PITCH_FIT_MARGIN_PT = 0.25  # small clearance around the text (points)
+PITCH_MAX_CANDIDATES = 30   # centre positions tried per facet
+PITCH_MAX_SHOWN = 900       # pitches above this are never labelled
+
+# Overlay look (drawn over the photo).
+OVERLAY_LINE_WIDTH = 1.6
+
+
+def segment_code(s):
+    """Edge-type code of a segment (a key of SEG_NAMES; UNSPECIFIED_CODE if unknown)."""
+    code = s.LegacyUserTypeOverride
+    code = int(code) if np.isscalar(code) and np.isfinite(code) else UNSPECIFIED_CODE
+    if code not in SEG_NAMES or code == UNSPECIFIED_CODE:
+        # no usable override: corner/wall edges are still recognisable from the segment's own Type
+        t = getattr(s, "Type", None)
+        if np.isscalar(t) and np.isfinite(t) and int(t) in (64, 65, 66, 67, 68, 69):
+            return int(t)
+        return UNSPECIFIED_CODE
+    return code
+
+
+def load_image_xform(path):
+    """4x4 registration transform (ImageData[].FwdXform, model -> top-down photo) or None.
+
+    Prefers the image with Heading 0 (the top-down one). It carries a small tilt (Rx/Ry) that shifts points by
+    an amount that grows with their height z, so raised points (ridge, eaves) land slightly off the flat x/y.
+    """
+    try:
+        with open(path, "rb") as fh:
+            mat = sio.loadmat(fh, struct_as_record=False, squeeze_me=True, variable_names=["ImageData"])
+        best = None
+        for im in np.atleast_1d(mat["ImageData"]):
+            x = np.asarray(getattr(im, "FwdXform", []), dtype=float)
+            if x.shape != (4, 4) or not np.isfinite(x).all():
+                continue
+            hd = np.asarray(getattr(im, "Heading", np.nan), dtype=float).ravel()
+            if hd.size and hd[0] == 0:
+                return x
+            if best is None:
+                best = x
+        return best
+    except Exception as e:  # missing ImageData etc.: just draw untilted
+        log.warning("No usable image transform (%s); drawing untilted", e)
+        return None
+
+
+def apply_xform(pts, xform):
+    """Apply a 4x4 column-vector transform to Nx3 points (NaN rows stay NaN)."""
+    return (xform @ np.c_[pts, np.ones(len(pts))].T).T[:, :3]
+
+
+def load_geometry(path, omit_infinite=True):
+    """Return (points Nx3 array, list of (segment_type, [i, j]) with 0-based indices)."""
+    # .evm files are renamed .mat files; open as a file object so the extension doesn't matter
+    log.info("Loading %s", path)
+    t0 = time.perf_counter()
+    with open(path, "rb") as fh:
+        mat = sio.loadmat(fh, struct_as_record=False, squeeze_me=True)
+    if "ThisStructure" not in mat:
+        sys.exit("No 'ThisStructure' variable found in the .evm file.")
+    ts = mat["ThisStructure"]
+    pts = np.array([[p.x, p.y, p.z] for p in np.atleast_1d(ts.Points)], dtype=float)
+    segs = []
+    for s in np.atleast_1d(ts.Segments):
+        idx = np.atleast_1d(s.Contains).astype(int) - 1  # MATLAB is 1-based
+        if len(idx) != 2:
+            segs.append((UNSPECIFIED_CODE, None))  # placeholder keeps facet segment indices aligned
+            continue
+        segs.append((segment_code(s), idx))
+    facets = []
+    facet_types = []  # Facets[].Type bit flags (Roof=512, Wall=1024, Material=16384, ...), parallel to facets
+    facet_materials = []  # Facets[].MaterialID (1 None, 2 Siding, 3 Masonry), parallel to facets
+    for f in np.atleast_1d(ts.Facets):
+        seg_ids = np.atleast_1d(f.Contains).astype(int) - 1  # segment indices (1-based in file)
+        pitch = f.Pitch if np.isscalar(f.Pitch) else np.nan
+        facets.append((seg_ids, float(pitch)))
+        ft = np.asarray(getattr(f, "Type", 0)).ravel()
+        facet_types.append(int(ft[0]) if ft.size and np.isfinite(ft[0]) else 0)
+        fm = np.asarray(getattr(f, "MaterialID", 0)).ravel()
+        facet_materials.append(int(fm[0]) if fm.size and np.isfinite(fm[0]) else 0)
+    if omit_infinite:  # the 3D view keeps infinite-pitch facets
+        segs = omit_infinite_pitch_facet_segments(segs, facets)
+    n_seg = sum(1 for _, ix in segs if ix is not None)
+    log.info("Loaded %d points, %d segments, %d facets in %.2fs",
+             len(pts), n_seg, len(facets), time.perf_counter() - t0)
+    return pts, segs, facets, facet_types, facet_materials
+
+
+def omit_infinite_pitch_facet_segments(segs, facets):
+    """Hide edges used only by facets whose pitch is infinite, preserving shared edges."""
+    infinite_ids = set()
+    other_ids = set()
+    for seg_ids, pitch in facets:
+        target = infinite_ids if np.isinf(pitch) else other_ids
+        target.update(int(k) for k in seg_ids if 0 <= int(k) < len(segs))
+    omitted_ids = infinite_ids - other_ids
+    if omitted_ids:
+        segs = [
+            (stype, None if i in omitted_ids else ix)
+            for i, (stype, ix) in enumerate(segs)
+        ]
+        log.info("Omitted %d segments belonging only to infinite-pitch facets", len(omitted_ids))
+    return segs
+
+
+def facet_polygon(seg_ids, segs_xy):
+    """Chain a facet's segments into an ordered vertex loop (list of point indices)."""
+    edges = [tuple(segs_xy[k]) for k in seg_ids if 0 <= k < len(segs_xy) and len(segs_xy[k]) == 2]
+    if not edges:
+        return []
+    loop = list(edges[0])
+    remaining = edges[1:]
+    while remaining:
+        for e in remaining:
+            if e[0] == loop[-1]:
+                loop.append(e[1]); remaining.remove(e); break
+            if e[1] == loop[-1]:
+                loop.append(e[0]); remaining.remove(e); break
+        else:
+            break  # open/broken chain
+    if len(loop) > 1 and loop[0] == loop[-1]:
+        loop.pop()
+    return loop
+
+
+def label_candidates(poly, n=60, max_candidates=PITCH_MAX_CANDIDATES):
+    """Points inside the polygon, best (furthest from the edges) first.
+
+    Returns an (k, 2) array. The first row is the point furthest from every edge
+    (as far as a coarse grid search finds); the rest are other well-inside points
+    so a wide label can slide along an elongated facet.
+    """
+    path = Path(poly)
+    lo, hi = poly.min(0), poly.max(0)
+    gx, gy = np.meshgrid(np.linspace(lo[0], hi[0], n), np.linspace(lo[1], hi[1], n))
+    grid = np.c_[gx.ravel(), gy.ravel()]
+    grid = grid[path.contains_points(grid)]
+    if len(grid) == 0:
+        return poly.mean(0)[None, :]
+    a, b = poly, np.roll(poly, -1, axis=0)
+    ab = b - a
+    denom = np.maximum((ab ** 2).sum(1), 1e-12)
+    ap = grid[:, None, :] - a[None, :, :]                       # (G, E, 2)
+    t = np.clip((ap * ab[None]).sum(2) / denom[None], 0, 1)     # (G, E)
+    nearest = a[None] + t[..., None] * ab[None]
+    d = np.linalg.norm(grid[:, None, :] - nearest, axis=2).min(1)
+    order = np.argsort(-d)
+    order = order[d[order] >= 0.5 * d[order[0]]]
+    if len(order) > max_candidates:
+        order = order[np.unique(np.r_[0, np.linspace(0, len(order) - 1, max_candidates).astype(int)])]
+    return grid[order]
+
+
+def label_point(poly):
+    """A point inside the polygon, as far from its edges as a coarse grid search finds."""
+    return label_candidates(poly)[0]
+
+
+def box_fits(path, poly, cx, cy, hw, hh, samples=10):
+    """True if the axis-aligned box centred on (cx, cy) lies fully inside the polygon."""
+    xs = np.linspace(cx - hw, cx + hw, samples)
+    ys = np.linspace(cy - hh, cy + hh, samples)
+    ring = np.r_[np.c_[xs, np.full_like(xs, cy - hh)], np.c_[xs, np.full_like(xs, cy + hh)],
+                 np.c_[np.full_like(ys, cx - hw), ys], np.c_[np.full_like(ys, cx + hw), ys]]
+    if not path.contains_points(ring).all():
+        return False
+    # a polygon corner poking into the box means a notch/line would be covered
+    poking = (np.abs(poly[:, 0] - cx) < hw) & (np.abs(poly[:, 1] - cy) < hh)
+    return not poking.any()
+
+
+def fit_pitch_label(poly, text, size_units, max_fontsize=PITCH_FONT_MAX):
+    """Pick (x, y, fontsize, fitted) for a pitch label.
+
+    Tries the default font size first and only steps down when the label can't be
+    placed fully inside the facet. size_units(text, fontsize) -> (width, height)
+    of the label (including its background box) in data units.
+    """
+    path = Path(poly)
+    cands = label_candidates(poly)
+    sizes = np.arange(max_fontsize, PITCH_FONT_MIN - 1e-9, -PITCH_FONT_STEP)
+    for fs in sizes:
+        w, h = size_units(text, float(fs))
+        for cx, cy in cands:
+            if box_fits(path, poly, cx, cy, w / 2, h / 2):
+                return float(cx), float(cy), float(fs), True
+    cx, cy = cands[0]
+    return float(cx), float(cy), float(sizes[-1]), False
+
+
+def fmt_pitch(p):
+    p = round(float(p), 1)
+    return f"{p:g}"
+
+
+def draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=PITCH_FONT_MAX, facet_types=None):
+    """Draw each facet's pitch, shrinking only when it won't fit."""
+    renderer = fig.canvas.get_renderer()
+    p0 = ax.transData.transform((0.0, 0.0))
+    p1 = ax.transData.transform((1.0, 0.0))
+    pt_per_unit = abs(p1[0] - p0[0]) * 72.0 / fig.dpi  # points per data unit (aspect is equal)
+    can_fit = bool(np.isfinite(pt_per_unit) and pt_per_unit > 0)
+    if not can_fit:
+        log.warning("Could not work out the drawing scale; pitch labels use the default size")
+
+    cache = {}
+
+    def size_units(text, fs):
+        key = (text, fs)
+        if key not in cache:
+            t = ax.text(0, 0, text, fontsize=fs, fontweight="bold", fontfamily="Arial")
+            bb = t.get_window_extent(renderer)
+            t.remove()
+            margin = PITCH_FIT_MARGIN_PT
+            cache[key] = ((bb.width * 72.0 / fig.dpi + margin) / pt_per_unit,
+                          (bb.height * 72.0 / fig.dpi + margin) / pt_per_unit)
+        return cache[key]
+
+    segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
+    drawn = shrunk = tight = skipped = 0
+    for n, (seg_ids, pv) in enumerate(facets, start=1):
+        if facet_types is not None and (facet_types[n - 1] & FLOOR_FLAG):  # Floor facets get no pitch label
+            skipped += 1
+            continue
+        if not np.isfinite(pv) or pv > PITCH_MAX_SHOWN:  # nan, inf or absurdly steep pitch: nothing sensible to show
+            skipped += 1
+            continue
+        facet_line_ids = [
+            int(k) for k in seg_ids
+            if 0 <= int(k) < len(segs) and segs[int(k)][1] is not None
+        ]
+        if pv == 0 and facet_line_ids and all(segs[k][0] == UNSPECIFIED_CODE for k in facet_line_ids):
+            log.debug("Facet %d: zero pitch hidden because all outline lines are gray", n)
+            skipped += 1
+            continue
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or np.isnan(pts[loop]).any():
+            log.debug("Facet %d: no usable outline, pitch label skipped", n)
+            skipped += 1
+            continue
+        poly = pts[loop][:, :2]
+        text = fmt_pitch(pv)
+        if can_fit:
+            x, y, fs, fitted = fit_pitch_label(poly, text, size_units, max_fontsize)
+        else:
+            x, y = label_point(poly)
+            fs, fitted = max_fontsize, True
+        if fs < max_fontsize:
+            shrunk += 1
+            log.info("Facet %d: pitch %s shrunk %.1f -> %.1f pt to fit", n, text, max_fontsize, fs)
+        if not fitted:
+            tight += 1
+            log.warning("Facet %d: pitch %s still does not fit at %.1f pt (facet is very small)", n, text, fs)
+        ax.text(x, y, text, ha="center", va="center", fontsize=fs,
+                fontweight="bold", fontfamily="Arial", color="#0a4d8c", zorder=4)
+        drawn += 1
+    log.info("Pitch labels: %d drawn, %d shrunk, %d too small even at minimum, %d skipped",
+             drawn, shrunk, tight, skipped)
+
+
+def plot_top_down(pts, segs, facets, out_path, pitch=True, dpi=300, match_image=None, facet_types=None):
+    ok = ~np.isnan(pts).any(axis=1)
+    if match_image:
+        import matplotlib.image as mpimg
+
+        h, w = mpimg.imread(match_image).shape[:2]
+        k = min(3.0, 4200 / max(w, h))
+        pitch_max_fontsize = PITCH_FONT_MAX * max(1.0, min(3.0, max(w * k, h * k) / 1400))
+        figsize = (w * k / dpi, h * k / dpi)
+    else:
+        pitch_max_fontsize = PITCH_FONT_MAX
+        figsize = (9, 9)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi, facecolor="white")
+    used = {}
+
+    for stype, ix in segs:
+        if ix is None:
+            continue
+        i, j = ix
+        if not (ok[i] and ok[j]):
+            continue
+        used[stype] = used.get(stype, 0) + 1
+        ax.plot([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]],
+                line_style(stype), color=SEG_COLORS[stype], lw=0.5,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0)
+    log.info("Drew %d segments (%s)", sum(used.values()),
+             ", ".join(f"{SEG_NAMES[c]}={n}" for c, n in sorted(used.items())) or "none")
+
+    ax.set_aspect("equal")
+    ax.invert_yaxis()  # image-style coordinates: y grows downward
+    ax.axis("off")  # no axes, ticks, grid or title - just the wireframe
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.03, top=0.97)  # keeps image square
+
+    if pitch:
+        fig.canvas.draw()  # settle limits/aspect so the data -> point scale is known
+        draw_pitch_labels(fig, ax, pts, segs, facets, max_fontsize=pitch_max_fontsize, facet_types=facet_types)
+    else:
+        log.info("Pitch labels hidden (--no-pitch)")
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def export_3d(pts, segs, facets, out_path, facet_types=None, facet_materials=None):
+    """Write the 3D geometry as JSON: {"P": [[x, y, z]...], "S": [[i, j, code]...], ...}.
+
+    Only points used by a drawn segment are kept (segments are re-indexed). Z is
+    reversed so the model is upright. Segment codes/colours are the same as the
+    top-down wireframe, so the 3D view matches it. Infinite-pitch facets keep their edges.
+    "F" holds one pitch label per facet: {"p": text, "l": [x, y, z]} with the label
+    placed inside the facet, on its plane (facets with no finite pitch - nan or
+    infinite - get no label).
+    """
+    ok = ~np.isnan(pts).any(axis=1)
+    ftypes = list(facet_types) if facet_types is not None else [0] * len(facets)
+    fmats = list(facet_materials) if facet_materials is not None else [0] * len(facets)
+    seg_ftypes = {}  # segment index -> set of the facet types that use it (the viewer's type toggles)
+    for (seg_ids, _), ft in zip(facets, ftypes):
+        for k in seg_ids:
+            seg_ftypes.setdefault(int(k), set()).add(int(ft))
+    kept = [(n, stype, ix) for n, (stype, ix) in enumerate(segs)
+            if ix is not None and ok[ix[0]] and ok[ix[1]]]
+    used = sorted({int(k) for _, _, ix in kept for k in ix})
+    remap = {old: new for new, old in enumerate(used)}
+    P = pts[used].copy()
+    P[:, 2] *= -1  # reverse Z
+
+    segs_xy = [tuple(ix) if ix is not None else () for _, ix in segs]
+    F = []
+    for fi, (seg_ids, pv) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or np.isnan(pts[loop]).any() or not np.isfinite(pv) or pv > PITCH_MAX_SHOWN or (ftypes[fi] & FLOOR_FLAG):
+            continue  # no usable outline, or nan/inf pitch: nothing to label
+        poly3 = pts[loop]
+        x, y = label_point(poly3[:, :2])
+        try:  # z on the facet's own plane (least squares); fall back to the mean height
+            a = np.c_[poly3[:, 0], poly3[:, 1], np.ones(len(poly3))]
+            cf = np.linalg.lstsq(a, poly3[:, 2], rcond=None)[0]
+            z = float(cf[0] * x + cf[1] * y + cf[2])
+        except Exception:
+            z = float(poly3[:, 2].mean())
+        F.append({"p": fmt_pitch(pv), "t": ftypes[fi],
+                  "l": [round(float(x), 2), round(float(y), 2), round(-z + 0.0, 2)]})
+    A = []  # shaded facet outlines: [materialID, facetType, [point indices]]
+    for fi, (seg_ids, _) in enumerate(facets):
+        loop = facet_polygon(seg_ids, segs_xy)
+        if len(loop) < 3 or any(int(k) not in remap for k in loop):
+            continue
+        A.append([fmats[fi], ftypes[fi], [remap[int(k)] for k in loop]])
+    data = {
+        "A": A,
+        "mat": {str(k): v for k, v in MATERIAL_COLORS.items()},
+        "matNames": {str(k): v for k, v in MATERIAL_NAMES.items()},
+        "matAlphas": {str(k): v for k, v in MATERIAL_ALPHAS.items()},
+        "hole": HOLE_COLOR,
+        "holeAlpha": HOLE_ALPHA,
+        "roof": ROOF_COLOR,
+        "roofAlpha": ROOF_ALPHA,
+        "surf": SURFACE_COLOR,
+        "surfAlpha": SURFACE_ALPHA,
+        "P": (np.round(P, 2) + 0.0).tolist(),  # + 0.0 turns -0.0 into 0.0
+        "S": [[remap[int(ix[0])], remap[int(ix[1])], int(stype), sorted(seg_ftypes.get(n, []))]
+              for n, stype, ix in kept],
+        "F": F,
+        "colors": {str(k): v for k, v in SEG_COLORS.items()},
+        "names": {str(k): v for k, v in SEG_NAMES.items()},
+    }
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    log.info("Wrote 3D geometry: %d points, %d segments, %d facet labels -> %s",
+             len(P), len(data["S"]), len(F), out_path)
+
+
+def wall_floor_only_segments(segs, facets, facet_types):
+    """Indices of segments used only by Wall (1024) / Floor (2048) facets (kept if any roof/other facet shares them)."""
+    used = {}
+    for (seg_ids, _), ft in zip(facets, facet_types):
+        for k in seg_ids:
+            used.setdefault(int(k), []).append(int(ft))
+    return {k for k, fts in used.items() if fts and all(t & (1024 | 2048) for t in fts)}
+
+
+def plot_overlay(pts, segs, img_path, out_path, scale=1.0, max_px=4200, skip=None):
+    """Draw the wireframe on top of the top-down photo (model x/y == photo pixels)."""
+    import matplotlib.image as mpimg
+
+    img = mpimg.imread(img_path)
+    h, w = img.shape[:2]
+    k = min(3.0, max_px / max(w, h))
+    log.info("Overlay on %s (%dx%d px, output scale %.2f, model scale %.2f)", img_path, w, h, k, scale)
+    dpi = 100
+    fig = plt.figure(figsize=(w * k / dpi, h * k / dpi), dpi=dpi, facecolor="black")
+    ax = fig.add_axes([0, 0, 1, 1])
+    if img.ndim == 2:
+        ax.imshow(img, cmap="gray", extent=(0, w, h, 0), interpolation="bilinear")
+    else:
+        ax.imshow(img, extent=(0, w, h, 0), interpolation="bilinear")
+
+    xy = pts[:, :2] * scale
+    ok = ~np.isnan(xy).any(axis=1)
+    if ok.any():
+        lo, hi = xy[ok].min(0), xy[ok].max(0)
+        if hi[0] > w * 1.02 or hi[1] > h * 1.02 or lo.min() < -0.02 * max(w, h):
+            log.warning("Wireframe extent x %.0f..%.0f, y %.0f..%.0f does not fit the %dx%d photo - try --scale",
+                        lo[0], hi[0], lo[1], hi[1], w, h)
+
+    drawn = 0
+    skip = skip or set()  # Wall / Floor segments are not shown on the overlay
+    for n, (stype, ix) in enumerate(segs):
+        if ix is None or n in skip:
+            continue
+        i, j = ix
+        if not (ok[i] and ok[j]):
+            continue
+        ax.plot([xy[i, 0], xy[j, 0]], [xy[i, 1], xy[j, 1]], line_style(stype),
+                color=SEG_COLORS[stype], lw=OVERLAY_LINE_WIDTH,
+                alpha=0.5 if stype == UNSPECIFIED_CODE else 1.0,
+                zorder=3)
+        drawn += 1
+    log.info("Drew %d segments on the photo (line width %.1f)", drawn, OVERLAY_LINE_WIDTH)
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("evm_file", help="Input .evm file")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Output PNG (default: <evm_file>_topdown.png)")
+    ap.add_argument("--no-pitch", action="store_true", help="Hide per-facet pitch labels")
+    ap.add_argument("--dpi", type=int, default=300)
+    ap.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging")
+    ap.add_argument("-q", "--quiet", action="store_true", help="Only log warnings and errors")
+    ap.add_argument("--overlay", default=None, metavar="IMAGE",
+                    help="Draw the wireframe on top of this top-down photo instead")
+    ap.add_argument("--no-tilt", action="store_true",
+                    help="Overlay only: do not apply the image registration tilt (ImageData FwdXform)")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Multiply model x/y by this to match the photo's resolution (overlay only)")
+    ap.add_argument("--match-image", default=None, metavar="IMAGE",
+                    help="Match the plain wireframe canvas dimensions to this image")
+    ap.add_argument("--json3d", action="store_true",
+                    help="Write the 3D geometry as JSON (for the interactive 3D view) instead of a PNG")
+    args = ap.parse_args()
+
+    # Log to stdout (flushed per line) so the lines stay in order with the final
+    # "Saved ..." message when a parent process captures the output.
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s", "%H:%M:%S"))
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
+                        handlers=[handler])
+
+    out = args.output or args.evm_file.rsplit(".", 1)[0] + ("_3d.json" if args.json3d else "_topdown.png")
+    mode = "3d" if args.json3d else "overlay" if args.overlay else "wireframe"
+    log.info("Rendering %s for %s -> %s", mode, args.evm_file, out)
+    t0 = time.perf_counter()
+    try:
+        pts, segs, facets, facet_types, facet_materials = load_geometry(args.evm_file, omit_infinite=not args.json3d)
+        if args.json3d:
+            export_3d(pts, segs, facets, out, facet_types, facet_materials)
+        elif args.overlay:
+            xf = None if args.no_tilt else load_image_xform(args.evm_file)
+            if xf is not None:
+                tilted = apply_xform(pts, xf)
+                shift = np.hypot(*(tilted[:, :2] - pts[:, :2]).T)
+                log.info("Applied registration tilt: points move up to %.1f px (mean %.1f px)",
+                         np.nanmax(shift), np.nanmean(shift))
+                pts = tilted
+            plot_overlay(pts, segs, args.overlay, out, scale=args.scale,
+                         skip=wall_floor_only_segments(segs, facets, facet_types))
+        else:
+            plot_top_down(pts, segs, facets, out,
+                          pitch=not args.no_pitch, dpi=args.dpi,
+                          match_image=args.match_image, facet_types=facet_types)
+    except Exception:
+        log.exception("Failed to render %s", mode)
+        sys.exit(1)
+    log.info("Finished %s in %.2fs", mode, time.perf_counter() - t0)
+    print(f"Saved {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+'@
+# Only PAR\Files\roof_wireframe.py is used (no embedded fallback copy).
+$WireframeScriptLocal = Get-PiaScriptLocal -FileName 'roof_wireframe.py'
+if ($WireframeScriptLocal) { Write-ParLog "wireframe script: $WireframeScriptLocal" 'INFO' 'startup' }
+else { Write-ParLog 'roof_wireframe.py not available - Ortho/3D Wireframe tiles will show an error' 'WARN' 'startup' }
 # fileinfo.exe writes its own intermediate file to a FIXED path in the
 # user's Temp folder while it parses (not something we control — it's
 # internal to the tool). With the request pool running several requests at
@@ -4055,7 +5792,11 @@ foreach ($varDef in @(
     @{ Name = 'InProgressRoots'  ; Value = $InProgressRoots }
     @{ Name = 'FolderCache'      ; Value = $FolderCache }
     @{ Name = 'FileInfoExeLocal' ; Value = $FileInfoExeLocal }
+    @{ Name = 'PythonExeLocal'   ; Value = $PythonExeLocal }
+    @{ Name = 'PythonIsShared'   ; Value = [bool]$PythonIsShared }
+    @{ Name = 'WireframeScriptLocal' ; Value = $WireframeScriptLocal }
     @{ Name = 'FileInfoExeLock'  ; Value = $FileInfoExeLock }
+    @{ Name = 'ParLogEnabled'    ; Value = $ParLogEnabled }
 )) {
     $entry = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry(
         $varDef.Name, $varDef.Value, $null)
@@ -4073,7 +5814,42 @@ $requestScript = {
     $ImageExtensions  = @('.jpg', '.jpeg')
     $ArchiveRootsFull = $ArchiveRoots.Values | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
 
+    # Same logger as the main script (pooled runspaces don't share functions).
+    function Write-ParLog {
+        param(
+            [Parameter(Mandatory, Position = 0)][string]$Message,
+            [Parameter(Position = 1)][ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO',
+            [Parameter(Position = 2)][string]$Source = 'http'
+        )
+        if (-not $ParLogEnabled) { return }
+        try {
+            $color = switch ($Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'DEBUG' { 'DarkGray' } default { 'Cyan' } }
+            Write-Host ("[{0}] [{1,-5}] [{2}] {3}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Level, $Source, $Message) -ForegroundColor $color
+        }
+        catch { }
+    }
+
+    # Short, readable description of a request for the log (file names, not raw UNC paths).
+    function Get-RequestDescription($ctx) {
+        $p = $ctx.Request.Url.AbsolutePath
+        $q = $ctx.Request.QueryString
+        switch ($p) {
+            '/api/images'     { return "images: report=$($q['reportId']) location=$($q['location'])$(if ($q['folderName']) { ' folder=' + $q['folderName'] })" }
+            '/api/file-info'  { return "file-info: report=$($q['reportId']) state=$($q['state']) source=$($q['source'])" }
+            '/api/wireframe'  { $mode = if ($q['view3d'] -eq '1') { '3d' } elseif ($q['view']) { "overlay-$($q['view'])" } elseif ($q['overlay'] -eq '1') { 'overlay' } else { 'wireframe' }; return "wireframe ($mode): $((("$($q['evm'])") -split '[\\/]')[-1])" }
+            '/api/image-file' { return "image-file: $((("$($q['path'])") -split '[\\/]')[-1])" }
+            default           { return "$($ctx.Request.HttpMethod) $p" }
+        }
+    }
+
     function Write-JsonResponse($ctx, $obj, [int]$statusCode = 200) {
+        try {
+            if ($statusCode -ge 400 -or (($obj -is [System.Collections.IDictionary]) -and $obj.Contains('found') -and -not $obj['found'])) {
+                $why = if ($obj['error']) { $obj['error'] } elseif ($obj['message']) { $obj['message'] } else { '(no detail)' }
+                Write-ParLog "$why" 'WARN' 'http'
+            }
+        }
+        catch { }
         $json  = $obj | ConvertTo-Json -Compress -Depth 6
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $ctx.Response.StatusCode     = $statusCode
@@ -4206,21 +5982,42 @@ $requestScript = {
         }
         $imagesDir = Join-Path $folder.FullName 'Images'
         $imageUrls = @()
+        $imageLabels = @()
+        $topDownUrl = $null
+        Write-ParLog "report $reportId -> folder '$($folder.Name)' (found by $searchMethod)" 'INFO' 'images'
         if (Test-Path -LiteralPath $imagesDir) {
             try {
                 # Direction order for elevation shots: Overview, North, East, West, South.
                 $ElevationOrder = @{ 'O' = 0; 'N' = 1; 'E' = 2; 'W' = 3; 'S' = 4 }
-                $files = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction Stop |
-                         Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() } |
+                $allImages = @(Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction Stop |
+                         Where-Object { $ImageExtensions -contains $_.Extension.ToLowerInvariant() })
+                # The top-down overview shot is named O_****_**.jpg. Pick the
+                # newest one explicitly (so it can't be pushed out by newer
+                # elevation shots) and show it first, then up to 4 others.
+                $topDownFile = $allImages |
+                         Where-Object { $_.Name -match '^O_[^_]+_[^_]+\.jpe?g$' } |
                          Sort-Object LastWriteTime -Descending |
-                         Select-Object -First 5 |
+                         Select-Object -First 1
+                $otherFiles = @($allImages |
+                         Where-Object { $_.Name -notmatch '^O_[^_]+_[^_]+\.jpe?g$' } |
+                         Sort-Object LastWriteTime -Descending |
+                         Select-Object -First $(if ($topDownFile) { 4 } else { 5 }) |
                          Sort-Object @{ Expression = {
                              $prefix = $_.BaseName.Substring(0,1).ToUpperInvariant()
                              if ($ElevationOrder.ContainsKey($prefix)) { $ElevationOrder[$prefix] } else { 99 }
-                         } }
+                         } })
+                $files = @(@($topDownFile) + $otherFiles | Where-Object { $_ })
                 $imageUrls = @($files | ForEach-Object { '/api/image-file?path=' + [Uri]::EscapeDataString($_.FullName) })
+                if ($topDownFile) { $topDownUrl = '/api/image-file?path=' + [Uri]::EscapeDataString($topDownFile.FullName) }
+                # Label for each photo, same order as $imageUrls: O_ = Ortho (top-down), N/E/W/S = elevations.
+                $ElevationLabels = @{ 'O' = 'Ortho (top)'; 'N' = 'North'; 'E' = 'East'; 'W' = 'West'; 'S' = 'South' }
+                $imageLabels = @($files | ForEach-Object {
+                    $lead = if ($_.BaseName) { $_.BaseName.Substring(0, 1).ToUpperInvariant() } else { '' }
+                    if ($ElevationLabels.ContainsKey($lead)) { $ElevationLabels[$lead] } else { '' }
+                })
+                Write-ParLog ("{0} image(s): {1}" -f $files.Count, ((@($files | ForEach-Object { $_.Name })) -join ', ')) 'INFO' 'images'
             }
-            catch { }
+            catch { Write-ParLog "couldn't list $imagesDir : $($_.Exception.Message)" 'WARN' 'images' }
         }
         Write-JsonResponse $ctx @{
             found       = $true
@@ -4232,6 +6029,8 @@ $requestScript = {
             matchCount  = 1
             imageCount  = $imageUrls.Count
             images      = $imageUrls
+            imageLabels = $imageLabels
+            topDown     = $topDownUrl
         }
     }
 
@@ -4270,6 +6069,140 @@ $requestScript = {
         catch {
             $ctx.Response.StatusCode = 404
         }
+    }
+
+    function Handle-Wireframe($ctx) {
+        # Renders a PNG from the given .evm via roof_wireframe.py:
+        #   (default)     plain top-down wireframe
+        #   overlay=1     wireframe drawn on the report's top-down photo
+        #                 (Images\O_****_**.jpg next to the Rollback folder)
+        #   view3d=1      3D geometry as JSON (not a PNG) for the rotatable 3D Wireframe tile
+        #                 (includes infinite-pitch facet edges; a pitch label per finite-pitch facet)
+        # Only .evm files under the known archive roots are accepted (same
+        # allow-list as Handle-ImageFile). Results are cached per file version.
+        $reqPath = $ctx.Request.QueryString['evm']
+        $overlay = ($ctx.Request.QueryString['overlay'] -eq '1')
+        $view3d  = ($ctx.Request.QueryString['view3d'] -eq '1')
+        # view=N|E|S|W: wireframe projected onto that oblique elevation photo (Images\N_****_**.jpg etc.)
+        $viewDir = "$($ctx.Request.QueryString['view'])".ToUpperInvariant()
+        if ($viewDir -notmatch '^[NESW]$') { $viewDir = '' }
+        if ($viewDir) { $overlay = $true }
+        if ($view3d) { $overlay = $false; $viewDir = '' }
+        if ([string]::IsNullOrWhiteSpace($reqPath)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Missing evm path' } 400
+            return
+        }
+        try { $full = [System.IO.Path]::GetFullPath($reqPath) }
+        catch { Write-JsonResponse $ctx @{ found = $false; error = 'Invalid evm path' } 400; return }
+        $withinKnownRoot = $false
+        foreach ($root in $ArchiveRootsFull) {
+            if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $withinKnownRoot = $true; break }
+        }
+        if (-not $withinKnownRoot -or [System.IO.Path]::GetExtension($full).ToLowerInvariant() -ne '.evm') {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Path not allowed' } 403
+            return
+        }
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'EVM file not found' } 404
+            return
+        }
+        if (-not $WireframeScriptLocal -or -not (Test-Path -LiteralPath $WireframeScriptLocal -PathType Leaf)) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'roof_wireframe.py not found (put it in the PAR Files folder next to config.json)' } 500
+            return
+        }
+        if (-not $PythonExeLocal) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Python 3 not found (needs numpy, scipy, matplotlib)' } 500
+            return
+        }
+        # <archive folder>\Rollback\<n>.0.evm  ->  <archive folder>\Images\O_****_**.jpg
+        $folderDir = Split-Path -Path (Split-Path -Path $full -Parent) -Parent
+        $imagesDir = Join-Path $folderDir 'Images'
+        $topDownFile = $null
+        # The photo the wireframe is drawn on: the top-down O_ photo, or the newest N_/E_/S_/W_ photo for view=.
+        $photoPattern = if ($viewDir) { "^$viewDir`_[^_]+_[^_]+\.jpe?g$" } else { '^O_[^_]+_[^_]+\.jpe?g$' }
+        if (-not $view3d -and (Test-Path -LiteralPath $imagesDir)) {
+            $topDownFile = Get-ChildItem -LiteralPath $imagesDir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $photoPattern } |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+        }
+        if ($overlay -and -not $topDownFile) {
+            if ($viewDir) {
+                Write-JsonResponse $ctx @{ found = $false; code = 'no-photo'; error = "No $viewDir photo ($viewDir`_****_**.jpg) found" } 404
+            } else {
+                Write-JsonResponse $ctx @{ found = $false; code = 'no-topdown'; error = 'No top-down image (O_****_**.jpg) found' } 404
+            }
+            return
+        }
+        $ticks = (Get-Item -LiteralPath $full).LastWriteTimeUtc.Ticks
+        $imageKey = if ($topDownFile) { "|$($topDownFile.FullName)|$($topDownFile.LastWriteTimeUtc.Ticks)" } else { '' }
+        $wfKey = if ($view3d) { "wf3d-v7:$full|$ticks" } elseif ($viewDir) { "wfv-v1:$viewDir|$full|$ticks$imageKey" } elseif ($overlay) { "wfo-v5:$full|$ticks$imageKey" } else { "wf-v5:$full|$ticks$imageKey" }
+        $png = $null
+        $cachedPng = $null
+        if ($FolderCache.TryGetValue($wfKey, [ref]$cachedPng) -and $cachedPng -is [byte[]]) {
+            Write-ParLog ("served from cache ({0:N0} KB)" -f ($cachedPng.Length / 1KB)) 'DEBUG' 'wireframe'
+            $png = $cachedPng
+        }
+        else {
+            $id       = [guid]::NewGuid().ToString('N')
+            $localEvm = Join-Path $env:TEMP "parwf_$id.evm"
+            $localImg = Join-Path $env:TEMP "parwf_$id.jpg"
+            $outPng   = Join-Path $env:TEMP ("parwf_$id" + $(if ($view3d) { '.json' } else { '.png' }))   # JSON for the 3D view
+            try {
+                Copy-Item -LiteralPath $full -Destination $localEvm -Force
+                $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--dpi', '300')
+                if ($view3d) { $pyArgs = @($WireframeScriptLocal, $localEvm, '-o', $outPng, '--json3d') }
+                elseif ($topDownFile) {
+                    Copy-Item -LiteralPath $topDownFile.FullName -Destination $localImg -Force
+                    $pyArgs += @('--match-image', $localImg)
+                }
+                if ($overlay -and -not $view3d) {
+                    $pyArgs += @('--overlay', $localImg)
+                    if ($viewDir) { $pyArgs += @('--view', $viewDir) }
+                }
+                $wfSw = [System.Diagnostics.Stopwatch]::StartNew()
+                Write-ParLog ("running {0} ({1})" -f [System.IO.Path]::GetFileName($WireframeScriptLocal), $(if ($view3d) { '3D geometry' } elseif ($overlay) { 'overlay' + $(if ($viewDir) { " ($viewDir view)" } else { '' }) + ' on ' + $topDownFile.Name } else { 'plain wireframe' })) 'DEBUG' 'wireframe'
+                $log = & $PythonExeLocal @pyArgs 2>&1 | Out-String
+                foreach ($pyLine in ($log -split "\r?\n")) {
+                    if (-not $pyLine.Trim()) { continue }
+                    $pyLevel = if ($pyLine -match '\b(ERROR|CRITICAL|Traceback)\b') { 'ERROR' } elseif ($pyLine -match '\bWARNING\b') { 'WARN' } else { 'DEBUG' }
+                    Write-ParLog $pyLine.TrimEnd() $pyLevel 'wireframe/py'
+                }
+                if (-not (Test-Path -LiteralPath $outPng -PathType Leaf) -and $log -match "No module named '?matplotlib" -and -not $PythonIsShared) {
+                    # matplotlib missing: try a per-user pip install once per PAR session, then retry.
+                    [System.Threading.Monitor]::Enter($FolderCache)
+                    try {
+                        if (-not $FolderCache.ContainsKey('mpl-install-tried')) {
+                            $FolderCache['mpl-install-tried'] = $true
+                            $null = & $PythonExeLocal -m pip install --user --disable-pip-version-check matplotlib 2>&1 | Out-String
+                        }
+                    }
+                    finally { [System.Threading.Monitor]::Exit($FolderCache) }
+                    $log = & $PythonExeLocal @pyArgs 2>&1 | Out-String
+                }
+                if (-not (Test-Path -LiteralPath $outPng -PathType Leaf)) {
+                    $lines  = @(($log -split "\r?\n") | Where-Object { $_.Trim() })
+                    $last   = if ($lines.Count) { $lines[-1].Trim() } else { 'no output from python' }
+                    $detail = $log.Trim()
+                    if ($detail.Length -gt 600) { $detail = $detail.Substring($detail.Length - 600) }
+                    Write-JsonResponse $ctx @{ found = $false; error = $last; detail = $detail } 500
+                    return
+                }
+                $png = [System.IO.File]::ReadAllBytes($outPng)
+                Write-ParLog ("rendered {0:N0} KB in {1} ms" -f ($png.Length / 1KB), $wfSw.ElapsedMilliseconds) 'OK' 'wireframe'
+            }
+            catch {
+                Write-JsonResponse $ctx @{ found = $false; error = "wireframe failed: $($_.Exception.Message)" } 500
+                return
+            }
+            finally {
+                Remove-Item -LiteralPath $localEvm, $localImg, $outPng -Force -ErrorAction SilentlyContinue
+            }
+            $FolderCache[$wfKey] = $png
+        }
+        $ctx.Response.ContentType     = if ($view3d) { 'application/json; charset=utf-8' } else { 'image/png' }
+        $ctx.Response.ContentLength64 = $png.Length
+        $ctx.Response.OutputStream.Write($png, 0, $png.Length)
     }
 
     function Handle-FileInfo($ctx) {
@@ -4365,6 +6298,7 @@ $requestScript = {
             return
         }
         $evmFile = $evmFiles[0].FullName
+        Write-ParLog "report $reportId -> $($folder.Name)\Rollback\$($evmFiles[0].Name)" 'INFO' 'file-info'
 
         # --- Output cache: if this exact .evm version has already been
         # parsed (by this request or a concurrent sibling one), skip
@@ -4380,6 +6314,7 @@ $requestScript = {
         $outputCacheKey = "out:$evmFile|$($evmWriteTime.Ticks)"
         $cachedEntry = $null
         if ($FolderCache.TryGetValue($outputCacheKey, [ref]$cachedEntry)) {
+            Write-ParLog "served from cache (rollback $rollbackVersion)" 'DEBUG' 'file-info'
             Write-JsonResponse $ctx @{
                 found      = $true
                 reportId   = $reportId
@@ -4403,6 +6338,10 @@ $requestScript = {
             Write-JsonResponse $ctx @{ found = $false; error = 'fileinfo tool not available (local cache empty and share unreachable)' } 500
             return
         }
+        if (-not $PythonExeLocal) {
+            Write-JsonResponse $ctx @{ found = $false; error = 'Python 3 not found. PAR looks for the shared Python on the PIA share (PythonPath in config.json) and then for a local install. Contact PIA' } 500
+            return
+        }
 
         # Copy the .evm locally before handing it to fileinfo.exe, rather
         # than pointing the tool at the UNC path directly — if the tool
@@ -4420,7 +6359,7 @@ $requestScript = {
             # $FileInfoExeLock's comment above for why.
             $FileInfoExeLock.Wait()
             $lockAcquired = $true
-            $output = & $fileInfoExe $localEvm 2>&1 | Out-String
+            $output = & $PythonExeLocal $fileInfoExe $localEvm 2>&1 | Out-String
             $execMs = $sw.ElapsedMilliseconds
         }
         catch {
@@ -4433,6 +6372,8 @@ $requestScript = {
         }
         $output = $output.Trim()
         $FolderCache[$outputCacheKey] = $output
+        if ($output -match '"status":\s*"ERROR"') { Write-ParLog "fileinfo reported an error: $output" 'WARN' 'file-info' }
+        else { Write-ParLog "parsed rollback $rollbackVersion (copy $copyMs ms, python $execMs ms)" 'OK' 'file-info' }
         Write-JsonResponse $ctx @{
             found      = $true
             reportId   = $reportId
@@ -4445,6 +6386,8 @@ $requestScript = {
         }
     }
 
+    $reqSw   = [System.Diagnostics.Stopwatch]::StartNew()
+    $logPath = $ctx.Request.Url.AbsolutePath
     try {
         $path = $ctx.Request.Url.AbsolutePath
         if ($path -eq '/api/images') {
@@ -4455,6 +6398,9 @@ $requestScript = {
         }
         elseif ($path -eq '/api/file-info') {
             Handle-FileInfo $ctx
+        }
+        elseif ($path -eq '/api/wireframe') {
+            Handle-Wireframe $ctx
         }
         elseif ($Assets.ContainsKey($path)) {
             $item  = $Assets[$path]
@@ -4467,8 +6413,18 @@ $requestScript = {
             $ctx.Response.StatusCode = 404
         }
     }
-    catch { }
-    finally { $ctx.Response.OutputStream.Close() }
+    catch { Write-ParLog "unhandled error for $logPath : $($_.Exception.Message)" 'ERROR' 'http' }
+    finally {
+        try {
+            if ($logPath -like '/api/*') {
+                $status = $ctx.Response.StatusCode
+                $lvl = if ($status -ge 500) { 'ERROR' } elseif ($status -ge 400) { 'WARN' } else { 'INFO' }
+                Write-ParLog ("{0} -> {1} ({2} ms)" -f (Get-RequestDescription $ctx), $status, $reqSw.ElapsedMilliseconds) $lvl 'http'
+            }
+        }
+        catch { }
+        $ctx.Response.OutputStream.Close()
+    }
 }
 # Background runspace whose only job is accepting connections and immediately
 # handing each one to the pool. Because Accept() itself is the only thing
@@ -4531,6 +6487,7 @@ $window.Add_Activated({
     try { $webView.Focus() | Out-Null } catch { }
 })
 $window.Add_Closed({
+    Write-ParLog 'Window closed - shutting down the local server' 'INFO' 'PAR'
     try { $listener.Stop() } catch { }
     try { $serverPs.Stop(); $serverPs.Dispose() } catch { }
     try { $listenerRunspace.Close() } catch { }
@@ -4544,6 +6501,7 @@ try {
     $coreEnv = $envTask.GetAwaiter().GetResult()
 }
 catch {
+    Write-ParLog "Couldn't create the WebView2 environment: $($_.Exception.Message)" 'ERROR' 'webview2'
     [System.Windows.MessageBox]::Show(
         "Couldn't create the WebView2 environment`n`n$($_.Exception.Message)`n`n" +
         "Make sure the Microsoft Edge WebView2 Runtime is installed " +
@@ -4555,6 +6513,7 @@ catch {
 $webView.add_CoreWebView2InitializationCompleted({
     param($eventSender, $e)
     if ($e.IsSuccess) {
+        Write-ParLog "WebView2 ready - opening $prefix" 'OK' 'webview2'
         # Disable WebView2's own browser-style right-click menu (Reload,
         # Back, View Source, etc.). The page has its own custom row context
         # menu with a JS-level e.preventDefault(), but that only covers the
@@ -4570,10 +6529,25 @@ $webView.add_CoreWebView2InitializationCompleted({
         $webView.CoreWebView2.add_NewWindowRequested({
             param($wvSender, $wvArgs)
             $wvArgs.Handled = $true
+            Write-ParLog "opening in default browser: $($wvArgs.Uri)" 'INFO' 'webview2'
             try { Start-Process $wvArgs.Uri } catch { }
+        })
+        # Page -> terminal log bridge: the page calls parLog()/console.error()/console.warn(),
+        # which post {level,message} here so UI actions and JS errors show up in this window.
+        $webView.CoreWebView2.add_WebMessageReceived({
+            param($wmSender, $wmArgs)
+            try {
+                $raw = $wmArgs.TryGetWebMessageAsString()
+                if (-not $raw) { return }
+                $m = $raw | ConvertFrom-Json
+                $lvl = switch ("$($m.level)") { 'error' { 'ERROR' } 'warn' { 'WARN' } 'ok' { 'OK' } default { 'INFO' } }
+                Write-ParLog "$($m.message)" $lvl 'page'
+            }
+            catch { }
         })
     }
     else {
+        Write-ParLog "WebView2 failed to initialize: $($e.InitializationException.Message)" 'ERROR' 'webview2'
         [System.Windows.MessageBox]::Show(
             "WebView2 failed to initialize`n`n$($e.InitializationException.Message)",
             'PAR — startup failed', 'OK', 'Error') | Out-Null

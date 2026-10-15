@@ -1,0 +1,8 @@
+{
+  "Enabled": true,
+  "AllowedRoles": [10, 16],
+  "LogPath": "P:\\1_Coordinators\\PIA\\PAR\\Logs\\PAR_usage.csv",
+  "Version": "3.10.15",
+  "TerminalDebugLogging": true,
+  "PythonPath": "%LOCALAPPDATA%\\PAR-App\\python\\python.exe"
+}
