@@ -1,0 +1,12 @@
+{
+  "Enabled": true,
+  "AllowedRoles": [10, 16],
+  "LogPath": "P:\\1_Coordinators\\PIA\\PAR\\Logs\\PAR_usage.csv",
+  "Version": "3.10.22b",
+  "TerminalDebugLogging": true,
+  "TerminalLogMode": "default",
+  "Wireframes": {
+    "Twister": { "Ortho": true, "3D": true, "North": true, "East": true, "South": true, "West": true },
+    "Hipster": { "Ortho": false, "3D": true, "North": false, "East": false, "South": false, "West": false }
+  }
+}
